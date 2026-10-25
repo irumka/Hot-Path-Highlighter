@@ -1,0 +1,8 @@
+// @p
+struct Quote {
+    bool active;
+    double price;
+    short venue;
+    long id;
+    char side;
+};

@@ -1,0 +1,14 @@
+<idea-plugin>
+    <id>dev.hotpath</id>
+    <name>Hot Path Highlighter</name>
+    <vendor>AM</vendor>
+    <depends>com.intellij.modules.platform</depends>
+    <extensions defaultExtensionNs="com.intellij">
+        <editorFactoryListener implementation="dev.hotpath.HotPathHighlighter"/>
+        <intentionAction>
+            <className>dev.hotpath.HotPathHighlighter$Optimize</className>
+            <category>C/C++</category>
+            <descriptionDirectoryName>Optimize</descriptionDirectoryName>
+        </intentionAction>
+    </extensions>
+</idea-plugin>
