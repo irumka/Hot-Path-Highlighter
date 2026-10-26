@@ -12,6 +12,7 @@ import com.intellij.psi.PsiFile;
 
 import java.awt.Color;
 import java.awt.Font;
+import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.geom.Rectangle2D;
 import java.util.ArrayList;
@@ -243,13 +244,37 @@ public class HotPathHighlighter implements EditorFactoryListener {
     @Override
     public void editorCreated(EditorFactoryEvent e) {
         Editor ed = e.getEditor();
-        ed.getDocument().addDocumentListener(new DocumentListener() {
-            @Override
-            public void documentChanged(DocumentEvent ev) {
-                update(ed);
-            }
-        });
+        MyListener listener = new MyListener(ed);
+        ed.getDocument().addDocumentListener(listener);
         update(ed);
+    }
+
+    /**
+     * Слушатель изменений документа. Хранит редактор и при каждой правке
+     * текста просит обновить разметку.
+     */
+    static class MyListener implements DocumentListener {
+        /** Редактор, за документом которого мы следим. */
+        Editor ed;
+
+        /**
+         * Создаёт слушатель.
+         *
+         * @param ed редактор
+         */
+        MyListener(Editor ed) {
+            this.ed = ed;
+        }
+
+        /**
+         * Вызывается после каждой правки текста.
+         *
+         * @param ev событие изменения документа
+         */
+        @Override
+        public void documentChanged(DocumentEvent ev) {
+            update(ed);
+        }
     }
 
     /**
@@ -259,7 +284,34 @@ public class HotPathHighlighter implements EditorFactoryListener {
      * @param ed редактор
      */
     static void update(Editor ed) {
-        ApplicationManager.getApplication().invokeLater(() -> refresh(ed));
+        RefreshTask task = new RefreshTask(ed);
+        ApplicationManager.getApplication().invokeLater(task);
+    }
+
+    /**
+     * Задача для очереди UI. Когда до неё дойдёт очередь, IDE вызовет
+     * {@code run}, а там мы обновим разметку.
+     */
+    static class RefreshTask implements Runnable {
+        /** Редактор, в котором надо обновить разметку. */
+        Editor ed;
+
+        /**
+         * Создаёт задачу.
+         *
+         * @param ed редактор
+         */
+        RefreshTask(Editor ed) {
+            this.ed = ed;
+        }
+
+        /**
+         * Выполняется в потоке UI, когда подойдёт очередь.
+         */
+        @Override
+        public void run() {
+            refresh(ed);
+        }
     }
 
     /**
@@ -270,7 +322,9 @@ public class HotPathHighlighter implements EditorFactoryListener {
      * @param text   текст подписи
      */
     static void addHint(Editor ed, int offset, String text) {
-        ed.getInlayModel().addAfterLineEndElement(offset, true, new Hint(text));
+        InlayModel model = ed.getInlayModel();
+        Hint hint = new Hint(text);
+        model.addAfterLineEndElement(offset, true, hint);
     }
 
     /**
@@ -286,56 +340,129 @@ public class HotPathHighlighter implements EditorFactoryListener {
      * @param ed редактор
      */
     static void refresh(Editor ed) {
-        Document doc = ed.getDocument();
-        String text = doc.getText();
-        InlayModel model = ed.getInlayModel();
+        String text = ed.getDocument().getText();
 
-        List<Inlay<?>> hints = model.getAfterLineEndElementsInRange(0, text.length());
-        for (int i = 0; i < hints.size(); i++) {
-            if (hints.get(i).getRenderer() instanceof Hint) {
-                Disposer.dispose(hints.get(i));
-            }
-        }
-        List<Inlay<?>> bars = model.getBlockElementsInRange(0, text.length());
-        for (int i = 0; i < bars.size(); i++) {
-            if (bars.get(i).getRenderer() instanceof Bar) {
-                Disposer.dispose(bars.get(i));
-            }
-        }
+        removeOldHints(ed, text.length());
+        removeOldBars(ed, text.length());
 
         ArrayList<HotRegionFinder.Region> regions = findAll(text);
         for (int k = 0; k < regions.size(); k++) {
             HotRegionFinder.Region r = regions.get(k);
-            ArrayList<Field> fields = parse(text.substring(r.bStart(), r.bEnd()));
-            if (fields == null) {
-                continue;
-            }
-            int n = fields.size();
-            int line = doc.getLineNumber(r.bStart());
-
-            if (n == 0 || !allKnown(fields)) {
-                addHint(ed, doc.getLineEndOffset(line), "layout unknown");
-                continue;
-            }
-
-            int[] o = offsets(fields);
-            String[] cells = new String[o[n]];
-            int sum = 0;
-            for (int i = 0; i < n; i++) {
-                Field f = fields.get(i);
-                sum = sum + f.size;
-                for (int b = o[i]; b < o[i] + f.size; b++) {
-                    cells[b] = f.name;
-                }
-                addHint(ed, r.bStart() + f.end + 1, "offset " + o[i] + ", size " + f.size);
-            }
-            addHint(ed, doc.getLineEndOffset(line), "size " + o[n] + ", wasted " + (o[n] - sum) + " B");
-
-            InlayProperties props = new InlayProperties();
-            props.showAbove(true);
-            props.relatesToPrecedingText(false);
-            model.addBlockElement(doc.getLineStartOffset(line), props, new Bar(cells));
+            drawRegion(ed, text, r);
         }
+    }
+
+    /**
+     * Удаляет все свои подписи {@code Hint} в конце строк.
+     *
+     * @param ed     редактор
+     * @param length длина текста документа
+     */
+    static void removeOldHints(Editor ed, int length) {
+        InlayModel model = ed.getInlayModel();
+        List<Inlay<?>> hints = model.getAfterLineEndElementsInRange(0, length);
+        for (int i = 0; i < hints.size(); i++) {
+            Inlay<?> inlay = hints.get(i);
+            if (inlay.getRenderer() instanceof Hint) {
+                Disposer.dispose(inlay);
+            }
+        }
+    }
+
+    /**
+     * Удаляет все свои карты памяти {@code Bar} над структурами.
+     *
+     * @param ed     редактор
+     * @param length длина текста документа
+     */
+    static void removeOldBars(Editor ed, int length) {
+        InlayModel model = ed.getInlayModel();
+        List<Inlay<?>> bars = model.getBlockElementsInRange(0, length);
+        for (int i = 0; i < bars.size(); i++) {
+            Inlay<?> inlay = bars.get(i);
+            if (inlay.getRenderer() instanceof Bar) {
+                Disposer.dispose(inlay);
+            }
+        }
+    }
+
+    /**
+     * Рисует разметку для одной структуры: подписи у полей, итог
+     * и карту памяти над ней.
+     *
+     * @param ed   редактор
+     * @param text весь текст файла
+     * @param r    регион одной структуры
+     */
+    static void drawRegion(Editor ed, String text, HotRegionFinder.Region r) {
+        Document doc = ed.getDocument();
+        InlayModel model = ed.getInlayModel();
+
+        String regionText = text.substring(r.bStart(), r.bEnd());
+        ArrayList<Field> fields = parse(regionText);
+        if (fields == null) {
+            return;
+        }
+
+        int n = fields.size();
+        int line = doc.getLineNumber(r.bStart());
+
+        if (n == 0 || !allKnown(fields)) {
+            addHint(ed, doc.getLineEndOffset(line), "layout unknown");
+            return;
+        }
+
+        int[] o = offsets(fields);
+        String[] cells = makeCells(fields, o);
+
+        for (int i = 0; i < n; i++) {
+            Field f = fields.get(i);
+            int position = r.bStart() + f.end + 1;
+            addHint(ed, position, "offset " + o[i] + ", size " + f.size);
+        }
+
+        int total = o[n];
+        int wasted = total - sumSizes(fields);
+        addHint(ed, doc.getLineEndOffset(line), "size " + total + ", wasted " + wasted + " B");
+
+        InlayProperties props = new InlayProperties();
+        props.showAbove(true);
+        props.relatesToPrecedingText(false);
+        Bar bar = new Bar(cells);
+        model.addBlockElement(doc.getLineStartOffset(line), props, bar);
+    }
+
+    /**
+     * Строит массив по байтам: в каждой ячейке имя поля, которому
+     * принадлежит байт, а у паддинга остаётся {@code null}.
+     *
+     * @param fields поля структуры
+     * @param o      смещения из {@code offsets}, последний элемент это размер
+     * @return массив длиной в размер структуры
+     */
+    static String[] makeCells(ArrayList<Field> fields, int[] o) {
+        String[] cells = new String[o[fields.size()]];
+        for (int i = 0; i < fields.size(); i++) {
+            Field f = fields.get(i);
+            for (int b = o[i]; b < o[i] + f.size; b++) {
+                cells[b] = f.name;
+            }
+        }
+        return cells;
+    }
+
+    /**
+     * Складывает размеры всех полей, то есть считает полезные байты.
+     *
+     * @param fields поля структуры
+     * @return сумма размеров без паддинга
+     */
+    static int sumSizes(ArrayList<Field> fields) {
+        int sum = 0;
+        for (int i = 0; i < fields.size(); i++) {
+            sum = sum + fields.get(i).size;
+        }
+        return sum;
     }
 
     /**
@@ -365,7 +492,9 @@ public class HotPathHighlighter implements EditorFactoryListener {
         public int calcWidthInPixels(Inlay inlay) {
             Editor e = inlay.getEditor();
             Font font = e.getColorsScheme().getFont(EditorFontType.PLAIN);
-            return e.getContentComponent().getFontMetrics(font).stringWidth(txt) + 12;
+            FontMetrics metrics = e.getContentComponent().getFontMetrics(font);
+            int textWidth = metrics.stringWidth(txt);
+            return textWidth + 12;
         }
 
         /**
@@ -378,9 +507,12 @@ public class HotPathHighlighter implements EditorFactoryListener {
          */
         @Override
         public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
+            Editor e = inlay.getEditor();
             g.setColor(Color.GRAY);
-            g.setFont(inlay.getEditor().getColorsScheme().getFont(EditorFontType.PLAIN));
-            g.drawString(txt, (float) r.getX() + 8, (float) r.getY() + inlay.getEditor().getAscent());
+            g.setFont(e.getColorsScheme().getFont(EditorFontType.PLAIN));
+            float x = (float) r.getX() + 8;
+            float y = (float) r.getY() + e.getAscent();
+            g.drawString(txt, x, y);
         }
     }
 
@@ -456,28 +588,66 @@ public class HotPathHighlighter implements EditorFactoryListener {
         @Override
         public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
             Font f = inlay.getEditor().getColorsScheme().getFont(EditorFontType.PLAIN);
-            g.setFont(f.deriveFont(f.getSize2D() * 0.8f));
+            float smallSize = f.getSize2D() * 0.8f;
+            g.setFont(f.deriveFont(smallSize));
+
             int x0 = (int) r.getX() + 4;
             int y0 = (int) r.getY();
+
+            drawLabel(g, x0, y0);
+
+            for (int b = 0; b < cells.length; b++) {
+                int column = b % 64;
+                int row = b / 64;
+                int x = x0 + column * w;
+                int y = y0 + labelH + row * h;
+                drawCell(g, b, x, y);
+            }
+        }
+
+        /**
+         * Рисует серую подпись над картой: размер и число кеш-линий.
+         *
+         * @param g  графика
+         * @param x0 левый край карты
+         * @param y0 верхний край карты
+         */
+        void drawLabel(Graphics2D g, int x0, int y0) {
             String s = "";
             if (rows() > 1) {
                 s = "s";
             }
+            String label = "memory map " + cells.length + " B, " + rows() + " cache line" + s;
             g.setColor(Color.GRAY);
-            g.drawString("memory map " + cells.length + " B, " + rows() + " cache line" + s, x0, y0 + g.getFontMetrics().getAscent() + 2);
-            for (int b = 0; b < cells.length; b++) {
-                int x = x0 + b % 64 * w;
-                int y = y0 + labelH + b / 64 * h;
-                if (cells[b] == null) {
-                    g.setColor(new Color(230, 70, 70));
-                } else {
-                    g.setColor(Color.getHSBColor((cells[b].hashCode() & 255) / 255f, 0.45f, 0.85f));
-                }
-                g.fillRoundRect(x, y, w - 2, h - 2, 4, 4);
-                if (cells[b] != null && (b == 0 || !cells[b].equals(cells[b - 1]))) {
-                    g.setColor(new Color(40, 40, 40));
-                    g.drawString(cells[b].substring(0, 1), x + 4, y + h - 5);
-                }
+            g.drawString(label, x0, y0 + g.getFontMetrics().getAscent() + 2);
+        }
+
+        /**
+         * Рисует квадрат одного байта и, если это первый байт поля,
+         * первую букву его имени.
+         *
+         * @param g графика
+         * @param b номер байта
+         * @param x левый край квадрата
+         * @param y верхний край квадрата
+         */
+        void drawCell(Graphics2D g, int b, int x, int y) {
+            if (cells[b] == null) {
+                g.setColor(new Color(230, 70, 70));
+            } else {
+                int hash = cells[b].hashCode() & 255;
+                float hue = hash / 255f;
+                g.setColor(Color.getHSBColor(hue, 0.45f, 0.85f));
+            }
+            g.fillRoundRect(x, y, w - 2, h - 2, 4, 4);
+
+            if (cells[b] == null) {
+                return;
+            }
+            boolean isFirstByteOfField = b == 0 || !cells[b].equals(cells[b - 1]);
+            if (isFirstByteOfField) {
+                g.setColor(new Color(40, 40, 40));
+                g.drawString(cells[b].substring(0, 1), x + 4, y + h - 5);
             }
         }
     }
@@ -518,26 +688,19 @@ public class HotPathHighlighter implements EditorFactoryListener {
             String doc = ed.getDocument().getText();
             int caret = ed.getCaretModel().getOffset();
             ArrayList<HotRegionFinder.Region> regions = findAll(doc);
+
             for (int k = 0; k < regions.size(); k++) {
                 HotRegionFinder.Region r = regions.get(k);
                 if (caret < r.mStart() || caret > r.bEnd()) {
                     continue;
                 }
+
                 ArrayList<Field> fields = parse(doc.substring(r.bStart(), r.bEnd()));
                 if (fields == null || fields.size() < 2 || !allKnown(fields)) {
                     return false;
                 }
 
-                ArrayList<Field> sorted = new ArrayList<>(fields);
-                for (int i = 0; i < sorted.size(); i++) {
-                    for (int j = 0; j < sorted.size() - 1 - i; j++) {
-                        if (sorted.get(j).al < sorted.get(j + 1).al) {
-                            Field tmp = sorted.get(j);
-                            sorted.set(j, sorted.get(j + 1));
-                            sorted.set(j + 1, tmp);
-                        }
-                    }
-                }
+                ArrayList<Field> sorted = sortByAlignment(fields);
                 int before = offsets(fields)[fields.size()];
                 int after = offsets(sorted)[sorted.size()];
                 if (after >= before) {
@@ -546,22 +709,71 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
                 Field first = fields.get(0);
                 Field last = fields.get(fields.size() - 1);
-                String raw = doc.substring(r.bStart() + first.start, r.bStart() + first.end);
-                String lead = raw.substring(0, raw.length() - raw.stripLeading().length());
-                String indent = "    ";
-                if (lead.contains("\n")) {
-                    indent = lead.substring(lead.lastIndexOf('\n') + 1);
-                }
-                repl = "";
-                for (int i = 0; i < sorted.size(); i++) {
-                    repl = repl + "\n" + indent + sorted.get(i).decl + ";";
-                }
+                String indent = findIndent(doc, r.bStart(), first);
+
+                repl = buildText(sorted, indent);
                 from = r.bStart() + first.start;
                 to = r.bStart() + last.end + 1;
                 text = "Optimize struct layout (" + before + " -> " + after + " B)";
                 return true;
             }
             return false;
+        }
+
+        /**
+         * Сортирует копию списка пузырьком по убыванию выравнивания.
+         * Поля с одинаковым выравниванием остаются в прежнем порядке.
+         *
+         * @param fields поля в исходном порядке
+         * @return новый отсортированный список
+         */
+        ArrayList<Field> sortByAlignment(ArrayList<Field> fields) {
+            ArrayList<Field> sorted = new ArrayList<>(fields);
+            for (int i = 0; i < sorted.size(); i++) {
+                for (int j = 0; j < sorted.size() - 1 - i; j++) {
+                    Field left = sorted.get(j);
+                    Field right = sorted.get(j + 1);
+                    if (left.al < right.al) {
+                        sorted.set(j, right);
+                        sorted.set(j + 1, left);
+                    }
+                }
+            }
+            return sorted;
+        }
+
+        /**
+         * Находит отступ первого поля. Если не получилось,
+         * возвращает четыре пробела.
+         *
+         * @param doc         текст документа
+         * @param regionStart начало региона в документе
+         * @param first       первое поле структуры
+         * @return строка из пробелов или табов
+         */
+        String findIndent(String doc, int regionStart, Field first) {
+            String raw = doc.substring(regionStart + first.start, regionStart + first.end);
+            String lead = raw.substring(0, raw.length() - raw.stripLeading().length());
+            if (lead.contains("\n")) {
+                return lead.substring(lead.lastIndexOf('\n') + 1);
+            }
+            return "    ";
+        }
+
+        /**
+         * Собирает новый текст объявлений: каждое поле на своей строке
+         * с отступом и точкой с запятой.
+         *
+         * @param sorted поля в новом порядке
+         * @param indent отступ для каждой строки
+         * @return текст для вставки в документ
+         */
+        String buildText(ArrayList<Field> sorted, String indent) {
+            String result = "";
+            for (int i = 0; i < sorted.size(); i++) {
+                result = result + "\n" + indent + sorted.get(i).decl + ";";
+            }
+            return result;
         }
 
         /**
