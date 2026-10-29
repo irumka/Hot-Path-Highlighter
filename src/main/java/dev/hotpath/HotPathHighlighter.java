@@ -92,6 +92,8 @@ public class HotPathHighlighter implements EditorFactoryListener {
         if (t.equals("short") || t.equals("int16_t") || t.equals("uint16_t")) return 2;
         if (t.equals("int") || t.equals("float") || t.equals("int32_t") || t.equals("uint32_t")) return 4;
         if (t.equals("long") || t.equals("double") || t.equals("int64_t") || t.equals("uint64_t") || t.equals("size_t")) return 8;
+        if (t.equals("vector")) return 24;
+        if (t.equals("string")) return 32;
         return 0;
     }
 
@@ -135,14 +137,24 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
         ArrayList<Field> fields = new ArrayList<>();
         int s = open + 1;
+        int depth = 0;
         for (int i = s; i < reg.length() - 1; i++) {
-            if (reg.charAt(i) != ';') {
+            char c = reg.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0 && reg.substring(s, i).contains("(")) {
+                    s = i + 1;
+                }
+            }
+            if (c != ';' || depth > 0) {
                 continue;
             }
             String decl = reg.substring(s, i).trim();
             int start = s;
             s = i + 1;
-            if (decl.isEmpty()) {
+            if (decl.isEmpty() || decl.contains("(")) {
                 continue;
             }
 
@@ -150,6 +162,10 @@ public class HotPathHighlighter implements EditorFactoryListener {
             int eq = clean.indexOf('=');
             if (eq >= 0) {
                 clean = clean.substring(0, eq).trim();
+            }
+            int brace = clean.indexOf('{');
+            if (brace >= 0) {
+                clean = clean.substring(0, brace).trim();
             }
             int count = 1;
             int bracket = clean.indexOf('[');
@@ -164,26 +180,33 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
             String name = "?";
             int al = 0;
+            int size = 0;
             int star = clean.lastIndexOf('*');
-            if (star >= 0) {
+            if (star >= 0 && star > clean.lastIndexOf('>')) {
                 al = 8;
+                size = 8;
                 name = clean.substring(star + 1).trim();
             } else {
                 int space = clean.lastIndexOf(' ');
                 if (space >= 0) {
                     name = clean.substring(space + 1).trim();
-                    String type = clean.substring(0, space).trim();
-                    int close = type.lastIndexOf('>');
-                    if (type.startsWith("std::atomic<") && close > 12) {
-                        type = type.substring(12, close).trim();
+                    String type = clean.substring(0, space).trim().replace("std::", "");
+                    int lt = type.indexOf('<');
+                    if (lt >= 0) {
+                        if (type.startsWith("atomic<")) {
+                            type = type.substring(lt + 1, type.lastIndexOf('>')).trim();
+                        } else {
+                            type = type.substring(0, lt).trim();
+                        }
                     }
-                    al = sizeOf(type);
+                    size = sizeOf(type);
+                    al = Math.min(size, 8);
                 }
             }
             if (count == 0) {
                 al = 0;
             }
-            fields.add(new Field(name, decl, al, al * count, start, i));
+            fields.add(new Field(name, decl, al, size * count, start, i));
         }
         return fields;
     }
@@ -397,6 +420,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
     static void drawRegion(Editor ed, String text, HotRegionFinder.Region r) {
         Document doc = ed.getDocument();
         InlayModel model = ed.getInlayModel();
+        int size;
 
         String regionText = text.substring(r.bStart(), r.bEnd());
         ArrayList<Field> fields = parse(regionText);
