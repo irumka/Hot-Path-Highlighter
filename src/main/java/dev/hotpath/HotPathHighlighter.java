@@ -2,9 +2,17 @@ package dev.hotpath;
 
 import com.intellij.codeInsight.intention.IntentionAction;
 import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.editor.*;
+import com.intellij.openapi.editor.Document;
+import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.editor.EditorCustomElementRenderer;
+import com.intellij.openapi.editor.Inlay;
+import com.intellij.openapi.editor.InlayModel;
+import com.intellij.openapi.editor.InlayProperties;
 import com.intellij.openapi.editor.colors.EditorFontType;
-import com.intellij.openapi.editor.event.*;
+import com.intellij.openapi.editor.event.DocumentEvent;
+import com.intellij.openapi.editor.event.DocumentListener;
+import com.intellij.openapi.editor.event.EditorFactoryEvent;
+import com.intellij.openapi.editor.event.EditorFactoryListener;
 import com.intellij.openapi.editor.markup.TextAttributes;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
@@ -16,26 +24,25 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.geom.Rectangle2D;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 
 /**
- * Основной класс плагина. Следит за открытием редакторов и изменениями
- * текста, разбирает помеченные C++ структуры и показывает в редакторе,
- * как лежат их поля в памяти.
+ * Main plugin class. Listens for editor openings and text changes, runs the
+ * full file analysis (layout + false sharing) and renders memory maps,
+ * per-field hints and conflict warnings in the editor.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
 
-    /**
-     * Создаёт обработчик. IDE вызывает его сама.
-     */
+    /** Creates the handler. The IDE calls it automatically. */
     public HotPathHighlighter() {
     }
 
     /**
-     * Ищет регионы для обоих маркеров, {@code @padding} и {@code @p}.
-     *
-     * @param text текст файла
-     * @return все найденные регионы
+     * Finds regions for both markers, {@code @padding} and {@code @p}.
+     * @param text file text
+     * @return all found regions
      */
     static ArrayList<HotRegionFinder.Region> findAll(String text) {
         ArrayList<HotRegionFinder.Region> all = HotRegionFinder.find(text, "@padding");
@@ -44,225 +51,9 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Одно поле структуры.
-     */
-    static class Field {
-        /** Имя поля. */
-        String name;
-        /** Объявление поля без точки с запятой. */
-        String decl;
-        /** Выравнивание в байтах, 0 если тип неизвестен. */
-        int al;
-        /** Размер в байтах, для массива уже умножен на число элементов. */
-        int size;
-        /** Начало объявления, от начала региона. */
-        int start;
-        /** Позиция точки с запятой, от начала региона. */
-        int end;
-
-        /**
-         * Создаёт описание поля.
-         *
-         * @param name  имя поля
-         * @param decl  объявление поля
-         * @param al    выравнивание в байтах
-         * @param size  размер в байтах
-         * @param start начало объявления
-         * @param end   позиция точки с запятой
-         */
-        Field(String name, String decl, int al, int size, int start, int end) {
-            this.name = name;
-            this.decl = decl;
-            this.al = al;
-            this.size = size;
-            this.start = start;
-            this.end = end;
-        }
-    }
-
-    /**
-     * Возвращает размер встроенного типа. Считается под 64-битную
-     * платформу, поэтому {@code long} это 8 байт.
-     *
-     * @param t имя типа, например {@code int}
-     * @return размер в байтах или 0, если тип неизвестен
-     */
-    static int sizeOf(String t) {
-        if (t.equals("char") || t.equals("bool") || t.equals("int8_t") || t.equals("uint8_t")) return 1;
-        if (t.equals("short") || t.equals("int16_t") || t.equals("uint16_t")) return 2;
-        if (t.equals("int") || t.equals("float") || t.equals("int32_t") || t.equals("uint32_t")) return 4;
-        if (t.equals("long") || t.equals("double") || t.equals("int64_t") || t.equals("uint64_t") || t.equals("size_t")) return 8;
-        if (t.equals("vector")) return 24;
-        if (t.equals("string")) return 32;
-        return 0;
-    }
-
-    /**
-     * Разбирает регион на поля. Однострочные комментарии забиваются
-     * пробелами, чтобы позиции остальных символов не сдвинулись.
-     * <p>
-     * Каждое поле заканчивается точкой с запятой. Модификаторы
-     * {@code unsigned}, {@code signed}, {@code const} и {@code volatile}
-     * отбрасываются, на размер они не влияют. Всё после {@code =}
-     * (значение по умолчанию) тоже отбрасывается, в {@code decl} оно
-     * при этом остаётся. Если размер массива не
-     * число, такое поле считать не умеем и выравнивание у него 0.
-     * Указатель всегда 8 байт, а {@code std::atomic<T>} занимает
-     * столько же, сколько {@code T}.
-     *
-     * @param reg текст региона от строки с маркером до закрывающей скобки
-     * @return список полей или {@code null}, если в заголовке нет struct и class
-     */
-    static ArrayList<Field> parse(String reg) {
-        char[] chars = reg.toCharArray();
-        boolean inComment = false;
-        for (int i = 0; i < chars.length; i++) {
-            if (chars[i] == '\n') {
-                inComment = false;
-            } else if (inComment || (chars[i] == '/' && i + 1 < chars.length && chars[i + 1] == '/')) {
-                inComment = true;
-                chars[i] = ' ';
-            }
-        }
-        reg = new String(chars);
-
-        int open = reg.indexOf('{');
-        if (open < 0) {
-            return null;
-        }
-        String header = reg.substring(0, open);
-        if (!header.contains("struct") && !header.contains("class")) {
-            return null;
-        }
-
-        ArrayList<Field> fields = new ArrayList<>();
-        int s = open + 1;
-        int depth = 0;
-        for (int i = s; i < reg.length() - 1; i++) {
-            char c = reg.charAt(i);
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0 && reg.substring(s, i).contains("(")) {
-                    s = i + 1;
-                }
-            }
-            if (c != ';' || depth > 0) {
-                continue;
-            }
-            String decl = reg.substring(s, i).trim();
-            int start = s;
-            s = i + 1;
-            if (decl.isEmpty() || decl.contains("(")) {
-                continue;
-            }
-
-            String clean = decl.replace("unsigned ", "").replace("signed ", "").replace("const ", "").replace("volatile ", "").replace("long long", "long");
-            int eq = clean.indexOf('=');
-            if (eq >= 0) {
-                clean = clean.substring(0, eq).trim();
-            }
-            int brace = clean.indexOf('{');
-            if (brace >= 0) {
-                clean = clean.substring(0, brace).trim();
-            }
-            int count = 1;
-            int bracket = clean.indexOf('[');
-            if (bracket >= 0) {
-                try {
-                    count = Integer.parseInt(clean.substring(bracket + 1, clean.indexOf(']')).trim());
-                } catch (Exception e) {
-                    count = 0;
-                }
-                clean = clean.substring(0, bracket).trim();
-            }
-
-            String name = "?";
-            int al = 0;
-            int size = 0;
-            int star = clean.lastIndexOf('*');
-            if (star >= 0 && star > clean.lastIndexOf('>')) {
-                al = 8;
-                size = 8;
-                name = clean.substring(star + 1).trim();
-            } else {
-                int space = clean.lastIndexOf(' ');
-                if (space >= 0) {
-                    name = clean.substring(space + 1).trim();
-                    String type = clean.substring(0, space).trim().replace("std::", "");
-                    int lt = type.indexOf('<');
-                    if (lt >= 0) {
-                        if (type.startsWith("atomic<")) {
-                            type = type.substring(lt + 1, type.lastIndexOf('>')).trim();
-                        } else {
-                            type = type.substring(0, lt).trim();
-                        }
-                    }
-                    size = sizeOf(type);
-                    al = Math.min(size, 8);
-                }
-            }
-            if (count == 0) {
-                al = 0;
-            }
-            fields.add(new Field(name, decl, al, size * count, start, i));
-        }
-        return fields;
-    }
-
-    /**
-     * Считает смещения полей с учётом выравнивания. Размер структуры
-     * в конце округляется до самого большого выравнивания среди полей.
-     *
-     * @param fields поля структуры в порядке объявления
-     * @return массив, где элемент {@code i} это смещение поля {@code i},
-     *         а последний элемент это размер всей структуры
-     */
-    static int[] offsets(ArrayList<Field> fields) {
-        int[] o = new int[fields.size() + 1];
-        int end = 0;
-        int maxAl = 1;
-        for (int i = 0; i < fields.size(); i++) {
-            Field f = fields.get(i);
-            int p = end;
-            if (p % f.al != 0) {
-                p = p + f.al - p % f.al;
-            }
-            o[i] = p;
-            end = o[i] + f.size;
-            if (f.al > maxAl) {
-                maxAl = f.al;
-            }
-        }
-        int p = end;
-        if (p % maxAl != 0) {
-            p = p + maxAl - p % maxAl;
-        }
-        o[fields.size()] = p;
-        return o;
-    }
-
-    /**
-     * Проверяет, что тип каждого поля известен.
-     *
-     * @param fields поля структуры
-     * @return {@code true}, если у всех полей выравнивание не нулевое
-     */
-    static boolean allKnown(ArrayList<Field> fields) {
-        for (int i = 0; i < fields.size(); i++) {
-            if (fields.get(i).al == 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Вызывается при открытии редактора. Подписывается на изменения
-     * документа и сразу строит разметку.
-     *
-     * @param e событие создания редактора
+     * Called when an editor is opened. Subscribes to document changes
+     * and immediately builds the layout.
+     * @param e editor creation event
      */
     @Override
     public void editorCreated(EditorFactoryEvent e) {
@@ -272,28 +63,15 @@ public class HotPathHighlighter implements EditorFactoryListener {
         update(ed);
     }
 
-    /**
-     * Слушатель изменений документа. Хранит редактор и при каждой правке
-     * текста просит обновить разметку.
-     */
+    /** Document change listener: requests a refresh on every text edit. */
     static class MyListener implements DocumentListener {
-        /** Редактор, за документом которого мы следим. */
+        /** Editor whose document we are watching. */
         Editor ed;
 
-        /**
-         * Создаёт слушатель.
-         *
-         * @param ed редактор
-         */
         MyListener(Editor ed) {
             this.ed = ed;
         }
 
-        /**
-         * Вызывается после каждой правки текста.
-         *
-         * @param ev событие изменения документа
-         */
         @Override
         public void documentChanged(DocumentEvent ev) {
             update(ed);
@@ -301,36 +79,23 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Откладывает обновление в поток UI: менять inlay прямо внутри
-     * события документа нельзя.
-     *
-     * @param ed редактор
+     * Defers the update to the UI thread: inlays cannot be changed
+     * directly inside a document event.
+     * @param ed editor
      */
     static void update(Editor ed) {
         RefreshTask task = new RefreshTask(ed);
         ApplicationManager.getApplication().invokeLater(task);
     }
 
-    /**
-     * Задача для очереди UI. Когда до неё дойдёт очередь, IDE вызовет
-     * {@code run}, а там мы обновим разметку.
-     */
+    /** Task for the UI queue that calls {@code refresh}. */
     static class RefreshTask implements Runnable {
-        /** Редактор, в котором надо обновить разметку. */
         Editor ed;
 
-        /**
-         * Создаёт задачу.
-         *
-         * @param ed редактор
-         */
         RefreshTask(Editor ed) {
             this.ed = ed;
         }
 
-        /**
-         * Выполняется в потоке UI, когда подойдёт очередь.
-         */
         @Override
         public void run() {
             refresh(ed);
@@ -338,49 +103,15 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Добавляет подпись в конец строки.
-     *
-     * @param ed     редактор
-     * @param offset позиция в тексте, на чьей строке появится подпись
-     * @param text   текст подписи
+     * Adds a colored hint at the end of the line containing {@code offset}.
      */
-    static void addHint(Editor ed, int offset, String text) {
+    static void addHint(Editor ed, int offset, String text, Color color) {
         InlayModel model = ed.getInlayModel();
-        Hint hint = new Hint(text);
+        Hint hint = new Hint(text, color);
         model.addAfterLineEndElement(offset, true, hint);
     }
 
-    /**
-     * Убирает старую разметку и строит новую для всех помеченных
-     * структур в документе. Удаляются только свои {@code Hint} и
-     * {@code Bar}, чужие inlay остаются.
-     * <p>
-     * Для карты памяти метод собирает массив, где у каждого байта
-     * записано имя поля, а у паддинга стоит {@code null}. Структуры
-     * без полей или с неизвестными типами получают подпись
-     * {@code layout unknown}.
-     *
-     * @param ed редактор
-     */
-    static void refresh(Editor ed) {
-        String text = ed.getDocument().getText();
-
-        removeOldHints(ed, text.length());
-        removeOldBars(ed, text.length());
-
-        ArrayList<HotRegionFinder.Region> regions = findAll(text);
-        for (int k = 0; k < regions.size(); k++) {
-            HotRegionFinder.Region r = regions.get(k);
-            drawRegion(ed, text, r);
-        }
-    }
-
-    /**
-     * Удаляет все свои подписи {@code Hint} в конце строк.
-     *
-     * @param ed     редактор
-     * @param length длина текста документа
-     */
+    /** Removes all own {@code Hint} end-of-line hints. */
     static void removeOldHints(Editor ed, int length) {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> hints = model.getAfterLineEndElementsInRange(0, length);
@@ -392,12 +123,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
         }
     }
 
-    /**
-     * Удаляет все свои карты памяти {@code Bar} над структурами.
-     *
-     * @param ed     редактор
-     * @param length длина текста документа
-     */
+    /** Removes all own {@code Bar} memory maps above the structs. */
     static void removeOldBars(Editor ed, int length) {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> bars = model.getBlockElementsInRange(0, length);
@@ -410,129 +136,182 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Рисует разметку для одной структуры: подписи у полей, итог
-     * и карту памяти над ней.
-     *
-     * @param ed   редактор
-     * @param text весь текст файла
-     * @param r    регион одной структуры
+     * Main entry point: analyzes the whole document and draws every
+     * marked struct. Analysis bugs never break the editor: each struct
+     * is drawn inside its own guard.
+     * @param ed editor
      */
-    static void drawRegion(Editor ed, String text, HotRegionFinder.Region r) {
-        Document doc = ed.getDocument();
-        InlayModel model = ed.getInlayModel();
-        int size;
-
-        String regionText = text.substring(r.bStart(), r.bEnd());
-        ArrayList<Field> fields = parse(regionText);
-        if (fields == null) {
+    static void refresh(Editor ed) {
+        String text = ed.getDocument().getText();
+        removeOldHints(ed, text.length());
+        removeOldBars(ed, text.length());
+        FileAnalyzer.Result result;
+        try {
+            result = FileAnalyzer.analyze(text);
+        } catch (Exception e) {
             return;
         }
-
-        int n = fields.size();
-        int line = doc.getLineNumber(r.bStart());
-
-        if (n == 0 || !allKnown(fields)) {
-            addHint(ed, doc.getLineEndOffset(line), "layout unknown");
+        if (result == null) {
             return;
         }
-
-        int[] o = offsets(fields);
-        String[] cells = makeCells(fields, o);
-
-        for (int i = 0; i < n; i++) {
-            Field f = fields.get(i);
-            int position = r.bStart() + f.end + 1;
-            addHint(ed, position, "offset " + o[i] + ", size " + f.size);
+        for (int k = 0; k < result.structs.size(); k++) {
+            FileAnalyzer.MarkedStruct m = result.structs.get(k);
+            try {
+                ensureCellsAndConflicts(m, text);
+                drawMarkedStruct(ed, m);
+            } catch (Exception e) {
+                // Skip a broken struct, keep the rest of the file usable.
+            }
         }
-
-        int total = o[n];
-        int wasted = total - sumSizes(fields);
-        addHint(ed, doc.getLineEndOffset(line), "size " + total + ", wasted " + wasted + " B");
-
-        InlayProperties props = new InlayProperties();
-        props.showAbove(true);
-        props.relatesToPrecedingText(false);
-        Bar bar = new Bar(cells);
-        model.addBlockElement(doc.getLineStartOffset(line), props, bar);
     }
 
     /**
-     * Строит массив по байтам: в каждой ячейке имя поля, которому
-     * принадлежит байт, а у паддинга остаётся {@code null}.
-     *
-     * @param fields поля структуры
-     * @param o      смещения из {@code offsets}, последний элемент это размер
-     * @return массив длиной в размер структуры
+     * Safety net: when the layout calculator did not fill the byte array,
+     * build it here and re-run the false sharing analysis, otherwise
+     * {@link FalseSharingAnalyzer} silently skips the layout.
+     * @param m    marked struct
+     * @param text full document text
      */
-    static String[] makeCells(ArrayList<Field> fields, int[] o) {
-        String[] cells = new String[o[fields.size()]];
-        for (int i = 0; i < fields.size(); i++) {
-            Field f = fields.get(i);
-            for (int b = o[i]; b < o[i] + f.size; b++) {
-                cells[b] = f.name;
+    static void ensureCellsAndConflicts(FileAnalyzer.MarkedStruct m, String text) {
+        if (m.layout == null || !m.layout.complete || m.layout.cells != null) {
+            return;
+        }
+        m.layout.cells = buildCells(m.layout);
+        int a = Math.max(0, Math.min(m.region.bStart(), text.length()));
+        int b = Math.max(a, Math.min(m.region.bEnd(), text.length()));
+        String block = text.substring(a, b);
+        m.conflicts = FalseSharingAnalyzer.analyze(m.layout, block);
+        m.risky = FalseSharingAnalyzer.riskyFields(m.conflicts);
+    }
+
+    /**
+     * Builds a byte-by-byte array of field indices: index per byte, -1 for padding.
+     * @param l computed layout
+     * @return array of length totalSize
+     */
+    static int[] buildCells(LayoutCalculator.Layout l) {
+        int[] cells = new int[Math.max(0, l.totalSize)];
+        Arrays.fill(cells, -1);
+        for (int i = 0; i < l.fields.size(); i++) {
+            CppStructParser.Field f = l.fields.get(i);
+            for (int b = f.offset; b < f.offset + f.size && b < cells.length; b++) {
+                if (b >= 0) {
+                    cells[b] = i;
+                }
             }
         }
         return cells;
     }
 
     /**
-     * Складывает размеры всех полей, то есть считает полезные байты.
-     *
-     * @param fields поля структуры
-     * @return сумма размеров без паддинга
+     * Draws one analyzed struct: memory map above it, a status label on
+     * the header line and per-field hints with conflict warnings.
+     * @param ed editor
+     * @param m  marked struct from FileAnalyzer
      */
-    static int sumSizes(ArrayList<Field> fields) {
-        int sum = 0;
-        for (int i = 0; i < fields.size(); i++) {
-            sum = sum + fields.get(i).size;
+    static void drawMarkedStruct(Editor ed, FileAnalyzer.MarkedStruct m) {
+        Document doc = ed.getDocument();
+        InlayModel model = ed.getInlayModel();
+        int headerLine = doc.getLineNumber(m.region.bStart());
+
+        if (m.layout == null || !m.layout.complete) {
+            addHint(ed, doc.getLineEndOffset(headerLine), "layout unknown", Color.GRAY);
+            return;
         }
-        return sum;
+
+        int[] layoutCells = m.layout.cells != null ? m.layout.cells : buildCells(m.layout);
+
+        // Convert int[] (field indices) to String[] (field names) for the Bar renderer
+        String[] stringCells = new String[layoutCells.length];
+        for (int i = 0; i < layoutCells.length; i++) {
+            if (layoutCells[i] >= 0 && layoutCells[i] < m.layout.fields.size()) {
+                stringCells[i] = m.layout.fields.get(layoutCells[i]).name;
+            }
+        }
+
+        // Mark bytes that belong to risky (conflicting) fields.
+        boolean[] riskyByte = new boolean[layoutCells.length];
+        HashMap<Integer, String> risky = m.risky != null ? m.risky : new HashMap<>();
+        for (Integer idx : risky.keySet()) {
+            if (idx == null || idx < 0 || idx >= m.layout.fields.size()) {
+                continue;
+            }
+            CppStructParser.Field f = m.layout.fields.get(idx);
+            for (int b = f.offset; b < f.offset + f.size && b < riskyByte.length; b++) {
+                if (b >= 0) {
+                    riskyByte[b] = true;
+                }
+            }
+        }
+
+        // Memory map above the struct header.
+        InlayProperties props = new InlayProperties();
+        props.showAbove(true);
+        props.relatesToPrecedingText(false);
+        Bar bar = new Bar(stringCells, riskyByte);
+        model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
+
+        // Status label on the header line.
+        String status = m.status();
+        Color labelColor = Color.GRAY;
+        if ("FALSE SHARING".equals(status)) {
+            labelColor = new Color(255, 90, 60);
+        } else if ("WARNING".equals(status)) {
+            labelColor = new Color(230, 180, 60);
+        } else if ("OK".equals(status)) {
+            labelColor = new Color(110, 190, 110);
+        }
+        String label = "size " + m.layout.totalSize + ", wasted " + m.layout.wasted + " B [" + status + "]";
+        if (m.conflicts != null && !m.conflicts.isEmpty()) {
+            label += " \u26A0 " + m.conflicts.size();
+        }
+        addHint(ed, doc.getLineEndOffset(headerLine), label, labelColor);
+
+        // Per-field hints at the semicolon line.
+        for (int i = 0; i < m.layout.fields.size(); i++) {
+            CppStructParser.Field f = m.layout.fields.get(i);
+            int position;
+            if (m.fieldEnds != null && i < m.fieldEnds.length) {
+                position = m.fieldEnds[i] + 1;
+            } else {
+                position = m.region.bStart() + f.end + 1;
+            }
+            position = Math.min(position, doc.getTextLength());
+            String hint = "offset " + f.offset + ", size " + f.size;
+            Color color = Color.GRAY;
+            String msg = risky.get(i);
+            if (msg != null) {
+                hint += " \u26A0 " + msg;
+                color = new Color(255, 90, 60);
+            }
+            addHint(ed, position, hint, color);
+        }
     }
 
-    /**
-     * Серая подпись в конце строки: смещение и размер поля
-     * или итог по всей структуре.
-     */
+    /** Gray or colored hint at the end of a line. */
     static class Hint implements EditorCustomElementRenderer {
-        /** Текст подписи. */
+        /** Hint text. */
         String txt;
+        /** Hint color. */
+        Color color;
 
-        /**
-         * Создаёт подпись.
-         *
-         * @param txt текст подписи
-         */
-        Hint(String txt) {
+        Hint(String txt, Color color) {
             this.txt = txt;
+            this.color = color;
         }
 
-        /**
-         * Считает ширину подписи в пикселях.
-         *
-         * @param inlay элемент редактора
-         * @return ширина текста плюс отступ
-         */
         @Override
         public int calcWidthInPixels(Inlay inlay) {
             Editor e = inlay.getEditor();
             Font font = e.getColorsScheme().getFont(EditorFontType.PLAIN);
             FontMetrics metrics = e.getContentComponent().getFontMetrics(font);
-            int textWidth = metrics.stringWidth(txt);
-            return textWidth + 12;
+            return metrics.stringWidth(txt) + 12;
         }
 
-        /**
-         * Рисует подпись серым цветом.
-         *
-         * @param inlay элемент редактора
-         * @param g     графика
-         * @param r     область под подпись
-         * @param a     атрибуты текста, не используются
-         */
         @Override
         public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
             Editor e = inlay.getEditor();
-            g.setColor(Color.GRAY);
+            g.setColor(color);
             g.setFont(e.getColorsScheme().getFont(EditorFontType.PLAIN));
             float x = (float) r.getX() + 8;
             float y = (float) r.getY() + e.getAscent();
@@ -541,44 +320,32 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Карта памяти над структурой: квадрат на байт, 64 в ряд
-     * (одна кеш-линия). У каждого поля свой цвет, паддинг красный.
+     * Memory map above the struct: one square per byte, 64 per row
+     * (one cache line). Field colors come from the name hash, padding is
+     * red, bytes involved in false sharing are bright red.
      */
     static class Bar implements EditorCustomElementRenderer {
-        /** Имя поля для каждого байта, null у паддинга. */
+        /** Field name for each byte, null for padding. */
         String[] cells;
-        /** Ширина квадрата в пикселях. */
+        /** True for bytes belonging to conflicting fields. */
+        boolean[] risky;
+        /** Width of one square in pixels. */
         int w = 14;
-        /** Высота квадрата в пикселях. */
+        /** Height of one square in pixels. */
         int h = 16;
-        /** Высота строки с подписью над картой. */
+        /** Height of the label row above the map. */
         int labelH = 20;
 
-        /**
-         * Создаёт карту памяти.
-         *
-         * @param cells имя поля для каждого байта структуры
-         */
-        Bar(String[] cells) {
+        Bar(String[] cells, boolean[] risky) {
             this.cells = cells;
+            this.risky = risky;
         }
 
-        /**
-         * Считает число рядов, то есть число кеш-линий.
-         *
-         * @return число рядов по 64 байта
-         */
+        /** Number of 64-byte rows, i.e. cache lines. */
         int rows() {
             return (cells.length + 63) / 64;
         }
 
-        /**
-         * Считает ширину карты в пикселях. Меньше 220 не бывает,
-         * иначе обрежется подпись сверху.
-         *
-         * @param inlay элемент редактора
-         * @return ширина карты с отступом
-         */
         @Override
         public int calcWidthInPixels(Inlay inlay) {
             int width = Math.min(cells.length, 64) * w;
@@ -588,88 +355,50 @@ public class HotPathHighlighter implements EditorFactoryListener {
             return width + 8;
         }
 
-        /**
-         * Считает высоту карты в пикселях.
-         *
-         * @param inlay элемент редактора
-         * @return высота подписи плюс все ряды
-         */
         @Override
         public int calcHeightInPixels(Inlay inlay) {
             return labelH + rows() * h + 6;
         }
 
-        /**
-         * Рисует подпись и квадраты байтов. Цвет поля берётся из хеша
-         * его имени, поэтому у одного поля он всегда одинаковый. На первом
-         * байте поля стоит первая буква имени.
-         *
-         * @param inlay элемент редактора
-         * @param g     графика
-         * @param r     область под карту
-         * @param a     атрибуты текста, не используются
-         */
         @Override
         public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
             Font f = inlay.getEditor().getColorsScheme().getFont(EditorFontType.PLAIN);
-            float smallSize = f.getSize2D() * 0.8f;
-            g.setFont(f.deriveFont(smallSize));
-
+            g.setFont(f.deriveFont(f.getSize2D() * 0.8f));
             int x0 = (int) r.getX() + 4;
             int y0 = (int) r.getY();
-
             drawLabel(g, x0, y0);
-
             for (int b = 0; b < cells.length; b++) {
                 int column = b % 64;
                 int row = b / 64;
-                int x = x0 + column * w;
-                int y = y0 + labelH + row * h;
-                drawCell(g, b, x, y);
+                drawCell(g, b, x0 + column * w, y0 + labelH + row * h);
             }
         }
 
-        /**
-         * Рисует серую подпись над картой: размер и число кеш-линий.
-         *
-         * @param g  графика
-         * @param x0 левый край карты
-         * @param y0 верхний край карты
-         */
+        /** Gray label above the map: total size and cache line count. */
         void drawLabel(Graphics2D g, int x0, int y0) {
-            String s = "";
-            if (rows() > 1) {
-                s = "s";
-            }
+            String s = rows() > 1 ? "s" : "";
             String label = "memory map " + cells.length + " B, " + rows() + " cache line" + s;
             g.setColor(Color.GRAY);
             g.drawString(label, x0, y0 + g.getFontMetrics().getAscent() + 2);
         }
 
-        /**
-         * Рисует квадрат одного байта и, если это первый байт поля,
-         * первую букву его имени.
-         *
-         * @param g графика
-         * @param b номер байта
-         * @param x левый край квадрата
-         * @param y верхний край квадрата
-         */
+        /** Draws one byte square plus the field initial on its first byte. */
         void drawCell(Graphics2D g, int b, int x, int y) {
+            HotPathSettings st = HotPathSettings.get();
             if (cells[b] == null) {
-                g.setColor(new Color(230, 70, 70));
+                g.setColor(st.paddingColor());
+            } else if (risky != null && b < risky.length && risky[b]) {
+                g.setColor(st.falseShareColor());
             } else {
                 int hash = cells[b].hashCode() & 255;
-                float hue = hash / 255f;
-                g.setColor(Color.getHSBColor(hue, 0.45f, 0.85f));
+                g.setColor(Color.getHSBColor(hash / 255f, 0.45f, 0.85f));
             }
             g.fillRoundRect(x, y, w - 2, h - 2, 4, 4);
-
             if (cells[b] == null) {
                 return;
             }
-            boolean isFirstByteOfField = b == 0 || !cells[b].equals(cells[b - 1]);
-            if (isFirstByteOfField) {
+            boolean first = b == 0 || !cells[b].equals(cells[b - 1]);
+            if (first) {
                 g.setColor(new Color(40, 40, 40));
                 g.drawString(cells[b].substring(0, 1), x + 4, y + h - 5);
             }
@@ -677,105 +406,83 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     /**
-     * Пункт меню Alt+Enter. Сортирует поля по убыванию выравнивания,
-     * если от этого структура становится меньше.
+     * Alt+Enter intention: reorders fields by descending alignment when
+     * that shrinks the struct. Thread annotations are preserved.
      */
     public static class Optimize implements IntentionAction {
-        /**
-         * Создаёт действие. IDE вызывает его сама.
-         */
+
+        /** Creates the action. The IDE calls it automatically. */
         public Optimize() {
         }
 
-        /** Текст пункта меню. В prepare к нему дописываются размеры до и после. */
+        /** Menu item text; prepare() appends before/after sizes. */
         String text = "Optimize struct layout";
-        /** Новый текст объявлений полей. */
+        /** Replacement text for the field declarations. */
         String repl;
-        /** Начало заменяемого куска в документе. */
+        /** Start of the replaced range in the document. */
         int from;
-        /** Конец заменяемого куска в документе. */
+        /** End of the replaced range in the document. */
         int to;
 
         /**
-         * Проверяет структуру под курсором и, если сортировка уменьшит
-         * размер, готовит новый текст.
-         * <p>
-         * Поля сортируются пузырьком по убыванию выравнивания, порядок
-         * равных полей при этом не меняется. Отступ для новых строк берётся
-         * у первого поля. Комментарии внутри структуры при замене
-         * пропадают, потому что поля пишутся заново.
-         *
-         * @param ed редактор
-         * @return {@code true}, если размер уменьшится
+         * Checks the struct under the caret and prepares the replacement
+         * when sorting by alignment reduces the total size.
+         * @param ed editor
+         * @return {@code true} when the optimization is applicable
          */
         boolean prepare(Editor ed) {
             String doc = ed.getDocument().getText();
             int caret = ed.getCaretModel().getOffset();
             ArrayList<HotRegionFinder.Region> regions = findAll(doc);
-
             for (int k = 0; k < regions.size(); k++) {
                 HotRegionFinder.Region r = regions.get(k);
                 if (caret < r.mStart() || caret > r.bEnd()) {
                     continue;
                 }
-
-                ArrayList<Field> fields = parse(doc.substring(r.bStart(), r.bEnd()));
-                if (fields == null || fields.size() < 2 || !allKnown(fields)) {
+                String block = doc.substring(r.bStart(), Math.min(r.bEnd(), doc.length()));
+                CppStructParser.StructInfo info = CppStructParser.parse(block);
+                if (info == null || info.fields.size() < 2) {
                     return false;
                 }
-
-                ArrayList<Field> sorted = sortByAlignment(fields);
-                int before = offsets(fields)[fields.size()];
-                int after = offsets(sorted)[sorted.size()];
-                if (after >= before) {
+                HashMap<String, int[]> locals = new HashMap<>();
+                LayoutCalculator.Layout before = LayoutCalculator.compute(info, locals);
+                if (!before.complete) {
                     return false;
                 }
-
-                Field first = fields.get(0);
-                Field last = fields.get(fields.size() - 1);
+                ArrayList<CppStructParser.Field> sorted = new ArrayList<>(info.fields);
+                sorted.sort((a, b) -> Integer.compare(b.align, a.align));
+                CppStructParser.StructInfo sortedInfo = copyWith(info, sorted);
+                LayoutCalculator.Layout after = LayoutCalculator.compute(sortedInfo, locals);
+                if (!after.complete || after.totalSize >= before.totalSize) {
+                    return false;
+                }
+                CppStructParser.Field first = info.fields.get(0);
+                CppStructParser.Field last = info.fields.get(info.fields.size() - 1);
                 String indent = findIndent(doc, r.bStart(), first);
-
                 repl = buildText(sorted, indent);
                 from = r.bStart() + first.start;
                 to = r.bStart() + last.end + 1;
-                text = "Optimize struct layout (" + before + " -> " + after + " B)";
+                text = "Optimize struct layout (" + before.totalSize + " -> " + after.totalSize + " B)";
                 return true;
             }
             return false;
         }
 
-        /**
-         * Сортирует копию списка пузырьком по убыванию выравнивания.
-         * Поля с одинаковым выравниванием остаются в прежнем порядке.
-         *
-         * @param fields поля в исходном порядке
-         * @return новый отсортированный список
-         */
-        ArrayList<Field> sortByAlignment(ArrayList<Field> fields) {
-            ArrayList<Field> sorted = new ArrayList<>(fields);
-            for (int i = 0; i < sorted.size(); i++) {
-                for (int j = 0; j < sorted.size() - 1 - i; j++) {
-                    Field left = sorted.get(j);
-                    Field right = sorted.get(j + 1);
-                    if (left.al < right.al) {
-                        sorted.set(j, right);
-                        sorted.set(j + 1, left);
-                    }
-                }
-            }
-            return sorted;
+        /** Copies struct metadata with a new field list. */
+        CppStructParser.StructInfo copyWith(CppStructParser.StructInfo src,
+                                            ArrayList<CppStructParser.Field> fields) {
+            CppStructParser.StructInfo copy = new CppStructParser.StructInfo();
+            copy.name = src.name;
+            copy.union = src.union;
+            copy.hasVptr = src.hasVptr;
+            copy.fields = fields;
+            copy.typedefs = src.typedefs;
+            copy.notes = src.notes;
+            return copy;
         }
 
-        /**
-         * Находит отступ первого поля. Если не получилось,
-         * возвращает четыре пробела.
-         *
-         * @param doc         текст документа
-         * @param regionStart начало региона в документе
-         * @param first       первое поле структуры
-         * @return строка из пробелов или табов
-         */
-        String findIndent(String doc, int regionStart, Field first) {
+        /** Indentation of the first field, four spaces as fallback. */
+        String findIndent(String doc, int regionStart, CppStructParser.Field first) {
             String raw = doc.substring(regionStart + first.start, regionStart + first.end);
             String lead = raw.substring(0, raw.length() - raw.stripLeading().length());
             if (lead.contains("\n")) {
@@ -784,63 +491,34 @@ public class HotPathHighlighter implements EditorFactoryListener {
             return "    ";
         }
 
-        /**
-         * Собирает новый текст объявлений: каждое поле на своей строке
-         * с отступом и точкой с запятой.
-         *
-         * @param sorted поля в новом порядке
-         * @param indent отступ для каждой строки
-         * @return текст для вставки в документ
-         */
-        String buildText(ArrayList<Field> sorted, String indent) {
-            String result = "";
+        /** Assembles the reordered declarations, keeping thread tags. */
+        String buildText(ArrayList<CppStructParser.Field> sorted, String indent) {
+            StringBuilder sb = new StringBuilder();
             for (int i = 0; i < sorted.size(); i++) {
-                result = result + "\n" + indent + sorted.get(i).decl + ";";
+                CppStructParser.Field f = sorted.get(i);
+                sb.append("\n").append(indent).append(f.decl).append(";");
+                if (f.thread != null) {
+                    sb.append(" // @thread ").append(f.thread);
+                }
             }
-            return result;
+            return sb.toString();
         }
 
-        /**
-         * Возвращает текст пункта меню.
-         *
-         * @return название действия
-         */
         @Override
         public String getText() {
             return text;
         }
 
-        /**
-         * Возвращает название группы действий.
-         *
-         * @return название группы
-         */
         @Override
         public String getFamilyName() {
             return "Hot path";
         }
 
-        /**
-         * Решает, показывать ли пункт: курсор должен стоять в помеченной
-         * структуре, которую можно уменьшить.
-         *
-         * @param p  проект
-         * @param ed редактор
-         * @param f  файл
-         * @return {@code true}, если структуру можно оптимизировать
-         */
         @Override
         public boolean isAvailable(Project p, Editor ed, PsiFile f) {
             return ed != null && prepare(ed);
         }
 
-        /**
-         * Заменяет объявления полей в документе на переставленные.
-         *
-         * @param p  проект
-         * @param ed редактор
-         * @param f  файл
-         */
         @Override
         public void invoke(Project p, Editor ed, PsiFile f) {
             if (prepare(ed)) {
@@ -848,11 +526,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
             }
         }
 
-        /**
-         * Действие меняет документ, поэтому выполняется внутри write action.
-         *
-         * @return {@code true}
-         */
         @Override
         public boolean startInWriteAction() {
             return true;
