@@ -1,215 +1,248 @@
 package dev.hotpath;
 
+import analysis.AccessPatternAnalyzer;
+import analysis.ZeroAllocLinter;
+import com.intellij.codeInsight.hint.HintManager;
 import com.intellij.codeInsight.intention.IntentionAction;
 import com.intellij.openapi.application.ApplicationManager;
-import com.intellij.openapi.editor.Document;
-import com.intellij.openapi.editor.Editor;
-import com.intellij.openapi.editor.EditorCustomElementRenderer;
-import com.intellij.openapi.editor.Inlay;
-import com.intellij.openapi.editor.InlayModel;
-import com.intellij.openapi.editor.InlayProperties;
+import com.intellij.openapi.editor.*;
 import com.intellij.openapi.editor.colors.EditorFontType;
-import com.intellij.openapi.editor.event.DocumentEvent;
-import com.intellij.openapi.editor.event.DocumentListener;
-import com.intellij.openapi.editor.event.EditorFactoryEvent;
-import com.intellij.openapi.editor.event.EditorFactoryListener;
+import com.intellij.openapi.editor.event.*;
 import com.intellij.openapi.editor.markup.TextAttributes;
+import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
+import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiFile;
+import core.FalseSharingDetector;
+import core.GlobalAtomicsAudit;
+import core.ProducerConsumerAnalyzer;
+import org.jetbrains.annotations.NotNull;
+import ui.HFTSettings;
 
-import java.awt.Color;
-import java.awt.Font;
-import java.awt.FontMetrics;
-import java.awt.Graphics2D;
+import java.awt.*;
 import java.awt.geom.Rectangle2D;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
+import java.util.*;
 import java.util.List;
 
 /**
- * Main plugin class. Listens for editor openings and text changes, runs the
- * full file analysis (layout + false sharing) and renders memory maps,
- * per-field hints and conflict warnings in the editor.
+ * Main plugin engine: Memory map rendering, Interactive Hover Tooltip Inspector,
+ * Zero-Alloc linting, Cache line splits, and Global Atomics Audit.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
 
-    /** Creates the handler. The IDE calls it automatically. */
     public HotPathHighlighter() {
     }
 
-    /**
-     * Finds regions for both markers, {@code @padding} and {@code @p}.
-     * @param text file text
-     * @return all found regions
-     */
     static ArrayList<HotRegionFinder.Region> findAll(String text) {
-        ArrayList<HotRegionFinder.Region> all = HotRegionFinder.find(text, "@padding");
-        all.addAll(HotRegionFinder.find(text, "@p"));
-        return all;
+        return HotRegionFinder.findAllStructs(text);
     }
 
-    /**
-     * Called when an editor is opened. Subscribes to document changes
-     * and immediately builds the layout.
-     * @param e editor creation event
-     */
     @Override
-    public void editorCreated(EditorFactoryEvent e) {
+    public void editorCreated(@NotNull EditorFactoryEvent e) {
         Editor ed = e.getEditor();
-        MyListener listener = new MyListener(ed);
-        ed.getDocument().addDocumentListener(listener);
+
+        ed.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void documentChanged(@NotNull DocumentEvent ev) {
+                update(ed);
+            }
+        });
+
+        ed.addEditorMouseMotionListener(new EditorMouseMotionListener() {
+            @Override
+            public void mouseMoved(@NotNull EditorMouseEvent event) {
+                handleMouseHover(ed, event);
+            }
+        });
+
         update(ed);
     }
 
-    /** Document change listener: requests a refresh on every text edit. */
-    static class MyListener implements DocumentListener {
-        /** Editor whose document we are watching. */
-        Editor ed;
-
-        MyListener(Editor ed) {
-            this.ed = ed;
-        }
-
-        @Override
-        public void documentChanged(DocumentEvent ev) {
-            update(ed);
+    @Override
+    public void editorReleased(@NotNull EditorFactoryEvent event) {
+        Editor ed = event.getEditor();
+        if (ed.getDocument() != null) {
+            removeOldHints(ed, ed.getDocument().getTextLength());
+            removeOldBars(ed, ed.getDocument().getTextLength());
         }
     }
 
-    /**
-     * Defers the update to the UI thread: inlays cannot be changed
-     * directly inside a document event.
-     * @param ed editor
-     */
-    static void update(Editor ed) {
-        RefreshTask task = new RefreshTask(ed);
-        ApplicationManager.getApplication().invokeLater(task);
-    }
-
-    /** Task for the UI queue that calls {@code refresh}. */
-    static class RefreshTask implements Runnable {
-        Editor ed;
-
-        RefreshTask(Editor ed) {
-            this.ed = ed;
+    private static void handleMouseHover(Editor ed, EditorMouseEvent event) {
+        HFTSettings.State state = HFTSettings.getInstance().getState();
+        if (!state.hoverTooltips || !state.showMemoryMapBar) {
+            return;
         }
 
-        @Override
-        public void run() {
-            refresh(ed);
-        }
-    }
-
-    /**
-     * Adds a colored hint at the end of the line containing {@code offset}.
-     */
-    static void addHint(Editor ed, int offset, String text, Color color) {
+        Point p = event.getMouseEvent().getPoint();
         InlayModel model = ed.getInlayModel();
-        Hint hint = new Hint(text, color);
-        model.addAfterLineEndElement(offset, true, hint);
+        List<Inlay<?>> inlays = model.getBlockElementsInRange(0, ed.getDocument().getTextLength());
+
+        for (Inlay<?> inlay : inlays) {
+            if (inlay.getRenderer() instanceof Bar) {
+                Rectangle bounds = inlay.getBounds();
+                if (bounds != null && bounds.contains(p)) {
+                    Bar bar = (Bar) inlay.getRenderer();
+                    bar.showHoverTooltip(ed, p, bounds);
+                    return;
+                }
+            }
+        }
     }
 
-    /** Removes all own {@code Hint} end-of-line hints. */
-    static void removeOldHints(Editor ed, int length) {
+    public static void update(Editor ed) {
+        if (ed == null || ed.isDisposed()) return;
+        ApplicationManager.getApplication().invokeLater(() -> {
+            if (ed != null && !ed.isDisposed()) refresh(ed);
+        });
+    }
+
+    public static void refreshAllEditors() {
+        ApplicationManager.getApplication().invokeLater(() -> {
+            Editor[] editors = EditorFactory.getInstance().getAllEditors();
+            for (Editor editor : editors) {
+                if (!editor.isDisposed()) {
+                    refresh(editor);
+                }
+            }
+        });
+    }
+
+    public static void removeOldHints(Editor ed, int length) {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> hints = model.getAfterLineEndElementsInRange(0, length);
-        for (int i = 0; i < hints.size(); i++) {
-            Inlay<?> inlay = hints.get(i);
+        for (Inlay<?> inlay : hints) {
             if (inlay.getRenderer() instanceof Hint) {
                 Disposer.dispose(inlay);
             }
         }
     }
 
-    /** Removes all own {@code Bar} memory maps above the structs. */
-    static void removeOldBars(Editor ed, int length) {
+    public static void removeOldBars(Editor ed, int length) {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> bars = model.getBlockElementsInRange(0, length);
-        for (int i = 0; i < bars.size(); i++) {
-            Inlay<?> inlay = bars.get(i);
+        for (Inlay<?> inlay : bars) {
             if (inlay.getRenderer() instanceof Bar) {
                 Disposer.dispose(inlay);
             }
         }
     }
 
-    /**
-     * Main entry point: analyzes the whole document and draws every
-     * marked struct. Analysis bugs never break the editor: each struct
-     * is drawn inside its own guard.
-     * @param ed editor
-     */
+    private static boolean isCppFile(Editor ed) {
+        VirtualFile vf = FileDocumentManager.getInstance().getFile(ed.getDocument());
+        if (vf == null) return false;
+        String ext = vf.getExtension();
+        if (ext == null) return false;
+        String lower = ext.toLowerCase();
+        return lower.equals("cpp") || lower.equals("cxx") || lower.equals("cc")
+                || lower.equals("c") || lower.equals("h") || lower.equals("hpp")
+                || lower.equals("hxx");
+    }
+
     static void refresh(Editor ed) {
         String text = ed.getDocument().getText();
         removeOldHints(ed, text.length());
         removeOldBars(ed, text.length());
+
+        HFTSettings.State state = HFTSettings.getInstance().getState();
+
+        if (state.autoEnableCpp && !isCppFile(ed)) {
+            return;
+        }
+
+        boolean anyEnabled = state.showMemoryMapBar || state.paddingVisualization || state.cacheLineBoundaries
+                || state.falseSharingDetection || state.hotColdSeparation
+                || state.zeroAllocLinter || state.globalAtomicsAudit
+                || state.showFieldOffsets || state.showPaddingBadges || state.showSplitBadges
+                || state.showFalseSharingBadges || state.showHotColdBadges;
+        if (!anyEnabled) {
+            return;
+        }
+
         FileAnalyzer.Result result;
         try {
             result = FileAnalyzer.analyze(text);
         } catch (Exception e) {
             return;
         }
-        if (result == null) {
-            return;
-        }
-        for (int k = 0; k < result.structs.size(); k++) {
-            FileAnalyzer.MarkedStruct m = result.structs.get(k);
+        if (result == null || result.structs == null) return;
+
+        for (FileAnalyzer.MarkedStruct m : result.structs) {
             try {
-                ensureCellsAndConflicts(m, text);
-                drawMarkedStruct(ed, m);
-            } catch (Exception e) {
-                // Skip a broken struct, keep the rest of the file usable.
+                Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap = ensureCellsAndConflicts(m, text, state);
+                drawMarkedStruct(ed, m, state, hotColdMap);
+            } catch (Exception ignored) {}
+        }
+
+        if (state.globalAtomicsAudit) {
+            List<GlobalAtomicsAudit.AuditConflict> globalConflicts = GlobalAtomicsAudit.audit(text, state.cacheLineSize);
+            for (GlobalAtomicsAudit.AuditConflict gc : globalConflicts) {
+                int lineNum = ed.getDocument().getLineNumber(gc.second.offsetInDoc);
+                int lineEnd = ed.getDocument().getLineEndOffset(lineNum);
+                addHint(ed, lineEnd, " [global false sharing: contiguous in .bss/.data]", Color.RED);
             }
         }
     }
 
-    /**
-     * Safety net: when the layout calculator did not fill the byte array,
-     * build it here and re-run the false sharing analysis, otherwise
-     * {@link FalseSharingAnalyzer} silently skips the layout.
-     * @param m    marked struct
-     * @param text full document text
-     */
-    static void ensureCellsAndConflicts(FileAnalyzer.MarkedStruct m, String text) {
-        if (m.layout == null || !m.layout.complete || m.layout.cells != null) {
-            return;
-        }
-        m.layout.cells = buildCells(m.layout);
+    static Map<String, AccessPatternAnalyzer.FieldAnalysis> ensureCellsAndConflicts(
+            FileAnalyzer.MarkedStruct m, String text, HFTSettings.State state) {
+        if (m.layout == null || !m.layout.complete) return null;
+        if (m.layout.cells == null) m.layout.cells = buildCells(m.layout);
+
         int a = Math.max(0, Math.min(m.region.bStart(), text.length()));
         int b = Math.max(a, Math.min(m.region.bEnd(), text.length()));
         String block = text.substring(a, b);
-        m.conflicts = FalseSharingAnalyzer.analyze(m.layout, block);
-        m.risky = FalseSharingAnalyzer.riskyFields(m.conflicts);
+
+        CppStructParser.StructInfo info = CppStructParser.parse(block);
+        if (info == null) return null;
+
+        ProducerConsumerAnalyzer.StructProfile profile = ProducerConsumerAnalyzer.analyze(info, block);
+
+        List<FalseSharingDetector.CacheField> cacheFields = new ArrayList<>();
+        for (int i = 0; i < m.layout.fields.size(); i++) {
+            CppStructParser.Field f = m.layout.fields.get(i);
+            ProducerConsumerAnalyzer.FieldProfile fp = profile.getFieldProfile(f.name);
+            boolean isAtomic = fp != null && fp.isAtomic;
+            boolean isProducer = fp != null && fp.isProducer();
+            boolean isConsumer = fp != null && fp.isConsumer();
+            boolean isArray = fp != null && fp.isArray;
+            int arrCount = fp != null ? fp.arraySize : 1;
+
+            cacheFields.add(new FalseSharingDetector.CacheField(
+                    f.name, f.offset, f.size, state.cacheLineSize, isAtomic, isProducer, isConsumer, isArray, arrCount
+            ));
+        }
+
+        FalseSharingDetector.Result detectorResult = FalseSharingDetector.detect(cacheFields, state.cacheLineSize, profile);
+
+        m.risky = new HashMap<>();
+        for (FalseSharingDetector.Conflict c : detectorResult.conflicts) {
+            for (int i = 0; i < m.layout.fields.size(); i++) {
+                CppStructParser.Field f = m.layout.fields.get(i);
+                if (f.name.equals(c.first.name) || f.name.equals(c.second.name)) {
+                    m.risky.put(i, c.description);
+                }
+            }
+        }
+
+        return AccessPatternAnalyzer.analyze(info, block);
     }
 
-    /**
-     * Builds a byte-by-byte array of field indices: index per byte, -1 for padding.
-     * @param l computed layout
-     * @return array of length totalSize
-     */
     static int[] buildCells(LayoutCalculator.Layout l) {
-        int[] cells = new int[Math.max(0, l.totalSize)];
+        int limit = Math.min(l.totalSize, 16384);
+        int[] cells = new int[Math.max(0, limit)];
         Arrays.fill(cells, -1);
         for (int i = 0; i < l.fields.size(); i++) {
             CppStructParser.Field f = l.fields.get(i);
             for (int b = f.offset; b < f.offset + f.size && b < cells.length; b++) {
-                if (b >= 0) {
-                    cells[b] = i;
-                }
+                if (b >= 0) cells[b] = i;
             }
         }
         return cells;
     }
 
-    /**
-     * Draws one analyzed struct: memory map above it, a status label on
-     * the header line and per-field hints with conflict warnings.
-     * @param ed editor
-     * @param m  marked struct from FileAnalyzer
-     */
-    static void drawMarkedStruct(Editor ed, FileAnalyzer.MarkedStruct m) {
+    static void drawMarkedStruct(Editor ed, FileAnalyzer.MarkedStruct m, HFTSettings.State state,
+                                 Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap) {
         Document doc = ed.getDocument();
         InlayModel model = ed.getInlayModel();
         int headerLine = doc.getLineNumber(m.region.bStart());
@@ -221,7 +254,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
         int[] layoutCells = m.layout.cells != null ? m.layout.cells : buildCells(m.layout);
 
-        // Convert int[] (field indices) to String[] (field names) for the Bar renderer
         String[] stringCells = new String[layoutCells.length];
         for (int i = 0; i < layoutCells.length; i++) {
             if (layoutCells[i] >= 0 && layoutCells[i] < m.layout.fields.size()) {
@@ -229,70 +261,136 @@ public class HotPathHighlighter implements EditorFactoryListener {
             }
         }
 
-        // Mark bytes that belong to risky (conflicting) fields.
         boolean[] riskyByte = new boolean[layoutCells.length];
-        HashMap<Integer, String> risky = m.risky != null ? m.risky : new HashMap<>();
-        for (Integer idx : risky.keySet()) {
-            if (idx == null || idx < 0 || idx >= m.layout.fields.size()) {
-                continue;
-            }
-            CppStructParser.Field f = m.layout.fields.get(idx);
-            for (int b = f.offset; b < f.offset + f.size && b < riskyByte.length; b++) {
-                if (b >= 0) {
-                    riskyByte[b] = true;
+        HashMap<Integer, String> risky = (m.risky != null && state.falseSharingDetection) ? m.risky : new HashMap<>();
+        if (state.falseSharingDetection) {
+            for (Integer idx : risky.keySet()) {
+                if (idx == null || idx < 0 || idx >= m.layout.fields.size()) continue;
+                CppStructParser.Field f = m.layout.fields.get(idx);
+                for (int b = f.offset; b < f.offset + f.size && b < riskyByte.length; b++) {
+                    if (b >= 0) riskyByte[b] = true;
                 }
             }
         }
 
-        // Memory map above the struct header.
-        InlayProperties props = new InlayProperties();
-        props.showAbove(true);
-        props.relatesToPrecedingText(false);
-        Bar bar = new Bar(stringCells, riskyByte);
-        model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
-
-        // Status label on the header line.
-        String status = m.status();
-        Color labelColor = Color.GRAY;
-        if ("FALSE SHARING".equals(status)) {
-            labelColor = new Color(255, 90, 60);
-        } else if ("WARNING".equals(status)) {
-            labelColor = new Color(230, 180, 60);
-        } else if ("OK".equals(status)) {
-            labelColor = new Color(110, 190, 110);
+        // 1. Карта памяти (Bar Inlay)
+        if (state.showMemoryMapBar && (state.cacheLineBoundaries || state.paddingVisualization)) {
+            InlayProperties props = new InlayProperties();
+            props.showAbove(true);
+            props.relatesToPrecedingText(false);
+            Bar bar = new Bar(stringCells, riskyByte, state.cacheLineSize, state, m.layout);
+            model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
         }
-        String label = "size " + m.layout.totalSize + ", wasted " + m.layout.wasted + " B [" + status + "]";
-        if (m.conflicts != null && !m.conflicts.isEmpty()) {
-            label += " \u26A0 " + m.conflicts.size();
-        }
-        addHint(ed, doc.getLineEndOffset(headerLine), label, labelColor);
 
-        // Per-field hints at the semicolon line.
-        for (int i = 0; i < m.layout.fields.size(); i++) {
-            CppStructParser.Field f = m.layout.fields.get(i);
-            int position;
-            if (m.fieldEnds != null && i < m.fieldEnds.length) {
-                position = m.fieldEnds[i] + 1;
-            } else {
-                position = m.region.bStart() + f.end + 1;
+        // 2. Статусный заголовок структуры
+        String status;
+        if (state.falseSharingDetection && !risky.isEmpty()) {
+            status = "FALSE SHARING";
+        } else if (state.paddingVisualization && m.layout.wasted > 0) {
+            status = "WARNING";
+        } else {
+            status = "OK";
+        }
+
+        Color labelColor = "FALSE SHARING".equals(status) ? Color.RED
+                : "WARNING".equals(status) ? new Color(220, 160, 50) : new Color(90, 170, 90);
+
+        StringBuilder label = new StringBuilder(m.layout.totalSize + "B");
+        if (state.paddingVisualization && m.layout.wasted > 0) {
+            label.append(" (pad ").append(m.layout.wasted).append("B)");
+        }
+        label.append(" [").append(status).append("]");
+
+        if (state.zeroAllocLinter) {
+            int bStart = Math.max(0, Math.min(m.region.bStart(), doc.getTextLength()));
+            int bEnd = Math.max(bStart, Math.min(m.region.bEnd(), doc.getTextLength()));
+            String blockText = doc.getText().substring(bStart, bEnd);
+            if (ZeroAllocLinter.hasZeroAllocHazards(m.info, blockText)) {
+                label.append(" [alloc hazard]");
+                labelColor = Color.RED;
             }
-            position = Math.min(position, doc.getTextLength());
-            String hint = "offset " + f.offset + ", size " + f.size;
-            Color color = Color.GRAY;
-            String msg = risky.get(i);
-            if (msg != null) {
-                hint += " \u26A0 " + msg;
-                color = new Color(255, 90, 60);
+        }
+
+        addHint(ed, doc.getLineEndOffset(headerLine), label.toString(), labelColor);
+
+        // 3. Строчные подсказки у полей
+        boolean showAnyHints = state.showFieldOffsets || state.showPaddingBadges
+                || state.showSplitBadges || state.showFalseSharingBadges || state.showHotColdBadges;
+
+        if (showAnyHints) {
+            int lineSize = state.cacheLineSize > 0 ? state.cacheLineSize : 64;
+            for (int i = 0; i < m.layout.fields.size(); i++) {
+                CppStructParser.Field f = m.layout.fields.get(i);
+                int position = (m.fieldEnds != null && i < m.fieldEnds.length)
+                        ? m.fieldEnds[i] + 1 : m.region.bStart() + f.end + 1;
+                position = Math.min(position, doc.getTextLength());
+
+                StringBuilder hint = new StringBuilder();
+                Color color = Color.GRAY;
+
+                if (state.showFieldOffsets) {
+                    hint.append("off ").append(f.offset).append(", ").append(f.size).append("B");
+                }
+
+                // Cache Line Split
+                if (state.showSplitBadges && state.cacheLineBoundaries && f.size > 1) {
+                    if (f.offset / lineSize != (f.offset + f.size - 1) / lineSize) {
+                        hint.append(" [split]");
+                        color = Color.RED;
+                    }
+                }
+
+                // Hot/Cold
+                if (state.showHotColdBadges && state.hotColdSeparation && hotColdMap != null) {
+                    AccessPatternAnalyzer.FieldAnalysis fa = hotColdMap.get(f.name);
+                    if (fa != null && fa.temperature == AccessPatternAnalyzer.Temperature.COLD) {
+                        hint.append(" [cold]");
+                        if (color.equals(Color.GRAY)) color = new Color(170, 120, 190);
+                    }
+                }
+
+                // Паддинг
+                if (state.showPaddingBadges && state.paddingVisualization) {
+                    int fieldEnd = f.offset + f.size;
+                    int nextOffset = (i + 1 < m.layout.fields.size()) ? m.layout.fields.get(i + 1).offset : m.layout.totalSize;
+                    int pad = nextOffset - fieldEnd;
+                    if (pad > 0) {
+                        hint.append(" [+").append(pad).append("B pad]");
+                        if (color.equals(Color.GRAY)) color = new Color(220, 140, 50);
+                    }
+                }
+
+                // False Sharing
+                String msg = risky.get(i);
+                if (state.showFalseSharingBadges && msg != null && state.falseSharingDetection) {
+                    if (msg.contains("Write-Write Ping-Pong")) {
+                        hint.append(" [write ping-pong]");
+                        color = Color.RED;
+                    } else if (msg.contains("Read Invalidation")) {
+                        hint.append(" [read invalidation]");
+                        color = new Color(240, 110, 40);
+                    } else if (msg.contains("Array False Sharing")) {
+                        hint.append(" [array conflict]");
+                        color = Color.RED;
+                    } else {
+                        hint.append(" [conflict]");
+                        color = Color.RED;
+                    }
+                }
+
+                if (hint.length() > 0) {
+                    addHint(ed, position, hint.toString().trim(), color);
+                }
             }
-            addHint(ed, position, hint, color);
         }
     }
 
-    /** Gray or colored hint at the end of a line. */
+    static void addHint(Editor ed, int offset, String text, Color color) {
+        ed.getInlayModel().addAfterLineEndElement(offset, true, new Hint(text, color));
+    }
+
     static class Hint implements EditorCustomElementRenderer {
-        /** Hint text. */
         String txt;
-        /** Hint color. */
         Color color;
 
         Hint(String txt, Color color) {
@@ -301,176 +399,221 @@ public class HotPathHighlighter implements EditorFactoryListener {
         }
 
         @Override
-        public int calcWidthInPixels(Inlay inlay) {
-            Editor e = inlay.getEditor();
-            Font font = e.getColorsScheme().getFont(EditorFontType.PLAIN);
-            FontMetrics metrics = e.getContentComponent().getFontMetrics(font);
-            return metrics.stringWidth(txt) + 12;
+        public int calcWidthInPixels(@NotNull Inlay inlay) {
+            Font font = inlay.getEditor().getColorsScheme().getFont(EditorFontType.PLAIN);
+            return inlay.getEditor().getContentComponent().getFontMetrics(font).stringWidth(txt) + 10;
         }
 
         @Override
-        public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
+        public void paint(@NotNull Inlay inlay, @NotNull Graphics2D g, @NotNull Rectangle2D r, @NotNull TextAttributes a) {
             Editor e = inlay.getEditor();
             g.setColor(color);
             g.setFont(e.getColorsScheme().getFont(EditorFontType.PLAIN));
-            float x = (float) r.getX() + 8;
-            float y = (float) r.getY() + e.getAscent();
-            g.drawString(txt, x, y);
+            g.drawString(txt, (float) r.getX() + 6, (float) r.getY() + e.getAscent());
         }
     }
 
-    /**
-     * Memory map above the struct: one square per byte, 64 per row
-     * (one cache line). Field colors come from the name hash, padding is
-     * red, bytes involved in false sharing are bright red.
-     */
     static class Bar implements EditorCustomElementRenderer {
-        /** Field name for each byte, null for padding. */
         String[] cells;
-        /** True for bytes belonging to conflicting fields. */
         boolean[] risky;
-        /** Width of one square in pixels. */
-        int w = 14;
-        /** Height of one square in pixels. */
-        int h = 16;
-        /** Height of the label row above the map. */
-        int labelH = 20;
+        int cacheLineSize;
+        HFTSettings.State state;
+        LayoutCalculator.Layout layout;
+        int w = 13;
+        int h = 15;
+        int labelH = 18;
+        private long lastTooltipTime = 0;
 
-        Bar(String[] cells, boolean[] risky) {
+        Bar(String[] cells, boolean[] risky, int cacheLineSize, HFTSettings.State state, LayoutCalculator.Layout layout) {
             this.cells = cells;
             this.risky = risky;
+            this.cacheLineSize = cacheLineSize > 0 ? cacheLineSize : 64;
+            this.state = state;
+            this.layout = layout;
         }
 
-        /** Number of 64-byte rows, i.e. cache lines. */
         int rows() {
-            return (cells.length + 63) / 64;
-        }
-
-        @Override
-        public int calcWidthInPixels(Inlay inlay) {
-            int width = Math.min(cells.length, 64) * w;
-            if (width < 220) {
-                width = 220;
+            int actual = (cells.length + cacheLineSize - 1) / cacheLineSize;
+            if (state.maxBarRows > 0) {
+                return Math.min(actual, state.maxBarRows);
             }
-            return width + 8;
+            return actual;
         }
 
         @Override
-        public int calcHeightInPixels(Inlay inlay) {
-            return labelH + rows() * h + 6;
+        public int calcWidthInPixels(@NotNull Inlay inlay) {
+            return Math.max(Math.min(cells.length, cacheLineSize) * w, 180) + 6;
         }
 
         @Override
-        public void paint(Inlay inlay, Graphics2D g, Rectangle2D r, TextAttributes a) {
+        public int calcHeightInPixels(@NotNull Inlay inlay) {
+            return labelH + rows() * h + 4;
+        }
+
+        @Override
+        public void paint(@NotNull Inlay inlay, @NotNull Graphics2D g, @NotNull Rectangle2D r, @NotNull TextAttributes a) {
             Font f = inlay.getEditor().getColorsScheme().getFont(EditorFontType.PLAIN);
-            g.setFont(f.deriveFont(f.getSize2D() * 0.8f));
-            int x0 = (int) r.getX() + 4;
+            g.setFont(f.deriveFont(f.getSize2D() * 0.75f));
+            int x0 = (int) r.getX() + 2;
             int y0 = (int) r.getY();
-            drawLabel(g, x0, y0);
-            for (int b = 0; b < cells.length; b++) {
-                int column = b % 64;
-                int row = b / 64;
-                drawCell(g, b, x0 + column * w, y0 + labelH + row * h);
-            }
-        }
 
-        /** Gray label above the map: total size and cache line count. */
-        void drawLabel(Graphics2D g, int x0, int y0) {
-            String s = rows() > 1 ? "s" : "";
-            String label = "memory map " + cells.length + " B, " + rows() + " cache line" + s;
+            int visibleRows = rows();
+            int maxBytesToPaint = Math.min(cells.length, visibleRows * cacheLineSize);
+
+            String s = visibleRows > 1 ? "s" : "";
             g.setColor(Color.GRAY);
-            g.drawString(label, x0, y0 + g.getFontMetrics().getAscent() + 2);
+            String title = cells.length + "B (" + visibleRows + " line" + s + ", " + cacheLineSize + "B)";
+            if (cells.length > maxBytesToPaint) {
+                title += " [truncated for performance]";
+            }
+            g.drawString(title, x0, y0 + g.getFontMetrics().getAscent());
+
+            for (int b = 0; b < maxBytesToPaint; b++) {
+                int column = b % cacheLineSize;
+                int row = b / cacheLineSize;
+                int cx = x0 + column * w;
+                int cy = y0 + labelH + row * h;
+
+                if (cells[b] == null) {
+                    g.setColor(state.paddingVisualization ? new Color(230, 75, 75) : new Color(60, 60, 60));
+                } else if (risky != null && b < risky.length && risky[b] && state.falseSharingDetection) {
+                    g.setColor(Color.RED);
+                } else {
+                    g.setColor(resolveCellColor(cells[b]));
+                }
+                g.fillRoundRect(cx, cy, w - 2, h - 2, 2, 2);
+
+                if (cells[b] != null && (b == 0 || !cells[b].equals(cells[b - 1]))) {
+                    g.setColor(new Color(30, 30, 30));
+                    g.drawString(cells[b].substring(0, 1), cx + 3, cy + h - 5);
+                }
+            }
         }
 
-        /** Draws one byte square plus the field initial on its first byte. */
-        void drawCell(Graphics2D g, int b, int x, int y) {
-            HotPathSettings st = HotPathSettings.get();
-            if (cells[b] == null) {
-                g.setColor(st.paddingColor());
-            } else if (risky != null && b < risky.length && risky[b]) {
-                g.setColor(st.falseShareColor());
+        private Color resolveCellColor(String fieldName) {
+            if (state.colorScheme == HFTSettings.ColorScheme.HIGH_CONTRAST) {
+                Color[] hcPalette = {
+                        new Color(0x0072B2), new Color(0xE69F00), new Color(0x56B4E9),
+                        new Color(0x009E73), new Color(0xF0E442), new Color(0xCC79A7)
+                };
+                int idx = Math.abs(fieldName.hashCode()) % hcPalette.length;
+                return hcPalette[idx];
+            } else if (state.colorScheme == HFTSettings.ColorScheme.NEON_HFT) {
+                Color[] neonPalette = {
+                        new Color(0x00F5FF), new Color(0x39FF14), new Color(0xFF007F),
+                        new Color(0xBF00FF), new Color(0xFFFF00), new Color(0xFF5F00)
+                };
+                int idx = Math.abs(fieldName.hashCode()) % neonPalette.length;
+                return neonPalette[idx];
             } else {
-                int hash = cells[b].hashCode() & 255;
-                g.setColor(Color.getHSBColor(hash / 255f, 0.45f, 0.85f));
+                int hash = fieldName.hashCode() & 255;
+                return Color.getHSBColor(hash / 255f, 0.40f, 0.80f);
             }
-            g.fillRoundRect(x, y, w - 2, h - 2, 4, 4);
-            if (cells[b] == null) {
-                return;
+        }
+
+        public void showHoverTooltip(Editor editor, Point mousePoint, Rectangle inlayBounds) {
+            if (System.currentTimeMillis() - lastTooltipTime < 400) return;
+
+            int relX = mousePoint.x - (inlayBounds.x + 2);
+            int relY = mousePoint.y - (inlayBounds.y + labelH);
+            if (relX < 0 || relY < 0) return;
+
+            int col = relX / w;
+            int row = relY / h;
+            int byteIndex = row * cacheLineSize + col;
+            if (byteIndex < 0 || byteIndex >= cells.length) return;
+
+            StringBuilder html = new StringBuilder("<html><div style='font-family:sans-serif;font-size:11px;padding:3px;'>");
+            html.append("<b>Byte Offset:</b> ").append(byteIndex).append(" / ").append(cells.length).append("<br>");
+            html.append("<b>Cache Line:</b> #").append(byteIndex / cacheLineSize)
+                    .append(" [").append((byteIndex / cacheLineSize) * cacheLineSize).append("..")
+                    .append(((byteIndex / cacheLineSize) + 1) * cacheLineSize - 1).append("]<br>");
+
+            String fieldName = cells[byteIndex];
+            if (fieldName == null) {
+                html.append("<b style='color:#e74c3c;'>Status:</b> Wasted Padding Gap<br>");
+            } else {
+                html.append("<b>Field:</b> <span style='color:#2980b9;'>").append(fieldName).append("</span><br>");
+                if (layout != null && layout.fields != null) {
+                    for (CppStructParser.Field f : layout.fields) {
+                        if (f.name.equals(fieldName)) {
+                            html.append("<b>Type:</b> ").append(f.type).append("<br>");
+                            html.append("<b>Span:</b> ").append(f.offset).append("..").append(f.offset + f.size - 1)
+                                    .append(" (").append(f.size).append("B)<br>");
+                            break;
+                        }
+                    }
+                }
+                if (risky != null && byteIndex < risky.length && risky[byteIndex]) {
+                    html.append("<b style='color:red;'>Hazard:</b> False Sharing Collision Detected!<br>");
+                }
             }
-            boolean first = b == 0 || !cells[b].equals(cells[b - 1]);
-            if (first) {
-                g.setColor(new Color(40, 40, 40));
-                g.drawString(cells[b].substring(0, 1), x + 4, y + h - 5);
-            }
+            html.append("</div></html>");
+
+            lastTooltipTime = System.currentTimeMillis();
+            HintManager.getInstance().showInformationHint(editor, html.toString());
         }
     }
 
-    /**
-     * Alt+Enter intention: reorders fields by descending alignment when
-     * that shrinks the struct. Thread annotations are preserved.
-     */
     public static class Optimize implements IntentionAction {
+        public Optimize() {}
 
-        /** Creates the action. The IDE calls it automatically. */
-        public Optimize() {
-        }
-
-        /** Menu item text; prepare() appends before/after sizes. */
         String text = "Optimize struct layout";
-        /** Replacement text for the field declarations. */
         String repl;
-        /** Start of the replaced range in the document. */
         int from;
-        /** End of the replaced range in the document. */
         int to;
 
-        /**
-         * Checks the struct under the caret and prepares the replacement
-         * when sorting by alignment reduces the total size.
-         * @param ed editor
-         * @return {@code true} when the optimization is applicable
-         */
         boolean prepare(Editor ed) {
             String doc = ed.getDocument().getText();
             int caret = ed.getCaretModel().getOffset();
             ArrayList<HotRegionFinder.Region> regions = findAll(doc);
-            for (int k = 0; k < regions.size(); k++) {
-                HotRegionFinder.Region r = regions.get(k);
-                if (caret < r.mStart() || caret > r.bEnd()) {
-                    continue;
-                }
+            for (HotRegionFinder.Region r : regions) {
+                if (caret < r.mStart() || caret > r.bEnd()) continue;
+
                 String block = doc.substring(r.bStart(), Math.min(r.bEnd(), doc.length()));
                 CppStructParser.StructInfo info = CppStructParser.parse(block);
-                if (info == null || info.fields.size() < 2) {
-                    return false;
-                }
+                if (info == null || info.fields.size() < 2) return false;
+
                 HashMap<String, int[]> locals = new HashMap<>();
                 LayoutCalculator.Layout before = LayoutCalculator.compute(info, locals);
-                if (!before.complete) {
-                    return false;
-                }
+                if (!before.complete) return false;
+
                 ArrayList<CppStructParser.Field> sorted = new ArrayList<>(info.fields);
                 sorted.sort((a, b) -> Integer.compare(b.align, a.align));
                 CppStructParser.StructInfo sortedInfo = copyWith(info, sorted);
                 LayoutCalculator.Layout after = LayoutCalculator.compute(sortedInfo, locals);
-                if (!after.complete || after.totalSize >= before.totalSize) {
-                    return false;
-                }
+                if (!after.complete || after.totalSize >= before.totalSize) return false;
+
                 CppStructParser.Field first = info.fields.get(0);
                 CppStructParser.Field last = info.fields.get(info.fields.size() - 1);
-                String indent = findIndent(doc, r.bStart(), first);
-                repl = buildText(sorted, indent);
-                from = r.bStart() + first.start;
-                to = r.bStart() + last.end + 1;
-                text = "Optimize struct layout (" + before.totalSize + " -> " + after.totalSize + " B)";
+
+                int firstStartInDoc = r.bStart() + first.start;
+                int lineStart = doc.lastIndexOf('\n', firstStartInDoc);
+                from = (lineStart != -1) ? lineStart + 1 : firstStartInDoc;
+
+                int nonWs = from;
+                while (nonWs < doc.length() && (doc.charAt(nonWs) == ' ' || doc.charAt(nonWs) == '\t')) nonWs++;
+                String indent = doc.substring(from, nonWs);
+                if (indent.isEmpty()) indent = "    ";
+
+                int lastEndInDoc = r.bStart() + last.end;
+                int lineEnd = doc.indexOf('\n', lastEndInDoc);
+                to = (lineEnd != -1) ? lineEnd : Math.min(lastEndInDoc + 1, doc.length());
+
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < sorted.size(); i++) {
+                    if (i > 0) sb.append("\n");
+                    sb.append(sorted.get(i).toFullCode(indent));
+                }
+                repl = sb.toString();
+
+                text = "Optimize struct layout (" + before.totalSize + " -> " + after.totalSize + "B)";
                 return true;
             }
             return false;
         }
 
-        /** Copies struct metadata with a new field list. */
-        CppStructParser.StructInfo copyWith(CppStructParser.StructInfo src,
-                                            ArrayList<CppStructParser.Field> fields) {
+        CppStructParser.StructInfo copyWith(CppStructParser.StructInfo src, ArrayList<CppStructParser.Field> fields) {
             CppStructParser.StructInfo copy = new CppStructParser.StructInfo();
             copy.name = src.name;
             copy.union = src.union;
@@ -481,49 +624,26 @@ public class HotPathHighlighter implements EditorFactoryListener {
             return copy;
         }
 
-        /** Indentation of the first field, four spaces as fallback. */
-        String findIndent(String doc, int regionStart, CppStructParser.Field first) {
-            String raw = doc.substring(regionStart + first.start, regionStart + first.end);
-            String lead = raw.substring(0, raw.length() - raw.stripLeading().length());
-            if (lead.contains("\n")) {
-                return lead.substring(lead.lastIndexOf('\n') + 1);
-            }
-            return "    ";
-        }
-
-        /** Assembles the reordered declarations, keeping thread tags. */
-        String buildText(ArrayList<CppStructParser.Field> sorted, String indent) {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < sorted.size(); i++) {
-                CppStructParser.Field f = sorted.get(i);
-                sb.append("\n").append(indent).append(f.decl).append(";");
-                if (f.thread != null) {
-                    sb.append(" // @thread ").append(f.thread);
-                }
-            }
-            return sb.toString();
-        }
-
+        @NotNull
         @Override
         public String getText() {
             return text;
         }
 
+        @NotNull
         @Override
         public String getFamilyName() {
-            return "Hot path";
+            return "HFT Optimizations";
         }
 
         @Override
-        public boolean isAvailable(Project p, Editor ed, PsiFile f) {
+        public boolean isAvailable(@NotNull Project p, Editor ed, PsiFile f) {
             return ed != null && prepare(ed);
         }
 
         @Override
-        public void invoke(Project p, Editor ed, PsiFile f) {
-            if (prepare(ed)) {
-                ed.getDocument().replaceString(from, to, repl);
-            }
+        public void invoke(@NotNull Project p, Editor ed, PsiFile f) {
+            if (prepare(ed)) ed.getDocument().replaceString(from, to, repl);
         }
 
         @Override

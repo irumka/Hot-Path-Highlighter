@@ -1,0 +1,83 @@
+<idea-plugin>
+    <id>com.irumka.hft.optimizer</id>
+    <name>HFT Memory Optimizer</name>
+    <vendor email="support@hotpath.dev" url="https://hotpath.dev">HotPath Dev</vendor>
+
+    <description><![CDATA[
+      High-frequency trading memory layout optimizer and static hardware latency analyzer.
+      Visualizes 64-byte L1 cache line boundaries, detects false sharing, ping-pong contention,
+      cache line splits, zero-alloc heap hazards, and provides instant Alt+Enter fixes.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="ui.HFTSettings"/>
+        <projectService serviceImplementation="ui.VisualizationManager"/>
+
+        <applicationConfigurable
+                parentId="tools"
+                instance="ui.HFTSettingsConfigurable"
+                id="com.irumka.hft.optimizer.settings"
+                displayName="HFT Optimizer"/>
+
+        <toolWindow
+                id="HFT Optimizer"
+                secondary="true"
+                anchor="right"
+                factoryClass="ui.HFTToolWindowFactory"
+                icon="AllIcons.Nodes.PpLibFolder"/>
+
+        <editorFactoryListener implementation="dev.hotpath.HotPathHighlighter"/>
+
+        <!-- Intentions -->
+        <intentionAction>
+            <className>dev.hotpath.HotPathHighlighter$Optimize</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.CacheLineAlignerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.CacheLineSplitFixerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.FalseSharingFixerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.HotColdSeparatorIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.ReorganizeProducerConsumerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.ArrayFalseSharingFixerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.SIMDCrashGuardIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.GlobalAtomicAlignerIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.SpinloopPauseIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.BitwiseMaskIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.CompileTimeGuardIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+    </extensions>
+</idea-plugin>

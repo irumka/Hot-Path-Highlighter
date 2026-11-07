@@ -1,139 +1,133 @@
 package dev.hotpath;
 
 import java.util.ArrayList;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Ищет в тексте файла структуры, помеченные маркером в комментарии.
+ * Finds C++ struct and class regions in text automatically.
+ * Supports standard, aligned and final definitions:
+ * 'struct Foo', 'struct alignas(64) Foo', 'class Bar final : public Base'.
  */
 public class HotRegionFinder {
 
-    /**
-     * Закрыт, потому что все методы класса статические.
-     */
-    private HotRegionFinder() {
-    }
-
-    /**
-     * Границы найденной структуры в тексте файла.
-     */
     public static class Region {
-        /** Начало строки с маркером. */
-        int mStart;
-        /** Конец строки с маркером. */
-        int mEnd;
-        /** Начало блока структуры, то есть строка после маркера. */
-        int bStart;
-        /** Позиция сразу после закрывающей фигурной скобки. */
-        int bEnd;
+        private final int markerStart;
+        private final int bodyStart;
+        private final int bodyEnd;
+        private final String name;
 
-        /**
-         * Создаёт регион по заданным границам.
-         *
-         * @param mStart начало строки с маркером
-         * @param mEnd   конец строки с маркером
-         * @param bStart начало блока структуры
-         * @param bEnd   позиция после закрывающей скобки
-         */
-        Region(int mStart, int mEnd, int bStart, int bEnd) {
-            this.mStart = mStart;
-            this.mEnd = mEnd;
-            this.bStart = bStart;
-            this.bEnd = bEnd;
+        public Region(int markerStart, int bodyStart, int bodyEnd, String name) {
+            this.markerStart = markerStart;
+            this.bodyStart = bodyStart;
+            this.bodyEnd = bodyEnd;
+            this.name = name != null ? name.trim() : "";
         }
 
-        /**
-         * Возвращает начало строки с маркером.
-         *
-         * @return позиция в тексте файла
-         */
         public int mStart() {
-            return mStart;
+            return markerStart;
         }
 
-        /**
-         * Возвращает конец строки с маркером.
-         *
-         * @return позиция в тексте файла
-         */
-        public int mEnd() {
-            return mEnd;
-        }
-
-        /**
-         * Возвращает начало блока структуры.
-         *
-         * @return позиция в тексте файла
-         */
         public int bStart() {
-            return bStart;
+            return bodyStart;
         }
 
-        /**
-         * Возвращает конец блока структуры.
-         *
-         * @return позиция в тексте файла
-         */
         public int bEnd() {
-            return bEnd;
+            return bodyEnd;
+        }
+
+        public String name() {
+            return name;
         }
     }
 
-    /**
-     * Ищет все структуры, перед которыми стоит заданный маркер.
-     * Маркер должен быть на отдельной строке: {@code // @p},
-     * {@code //@p} или то же самое в блочном комментарии. Вместо
-     * {@code @p} подходит и {@code @padding}.
-     * <p>
-     * После маркера метод идёт по строкам и считает фигурные скобки до
-     * закрывающей. Если до первой открывающей скобки встретилась точка
-     * с запятой, после маркера идёт не структура, и регион не создаётся.
-     *
-     * @param text   весь текст файла
-     * @param marker {@code @p} или {@code @padding}, без символов комментария
-     * @return найденные регионы
-     */
-    public static ArrayList<Region> find(String text, String marker) {
-        ArrayList<Region> result = new ArrayList<>();
-        String[] lines = text.split("\n");
-        int pos = 0;
+    private static final Pattern STRUCT_PATTERN = Pattern.compile(
+            "((?://\\s*@(padding|p)[^\\n]*\\n\\s*)|(?:alignas\\s*\\([^)]*\\)\\s*))*\\b(struct|class)\\s+(?:alignas\\s*\\([^)]*\\)\\s+|(?:\\[\\[[^\\]]*\\]\\]\\s+)?)*([a-zA-Z_0-9]+)\\s*(?:final\\s*)?(?::\\s*[^{]+)?\\{",
+            Pattern.MULTILINE
+    );
 
-        for (int i = 0; i < lines.length; i++) {
-            String trimmed = lines[i].trim();
-            boolean isMarker = trimmed.equals("// " + marker)
-                    || trimmed.equals("//" + marker)
-                    || trimmed.equals("/* " + marker + " */");
+    public static ArrayList<Region> findAllStructs(String text) {
+        ArrayList<Region> regions = new ArrayList<>();
+        if (text == null || text.isEmpty()) {
+            return regions;
+        }
 
-            if (isMarker) {
-                int mStart = pos;
-                int mEnd = pos + lines[i].length();
-                int lineStart = mEnd + 1;
-                int bracket = 0;
-                boolean done = false;
+        Matcher matcher = STRUCT_PATTERN.matcher(text);
+        while (matcher.find()) {
+            int markerStart = matcher.start();
+            int structKeywordStart = matcher.start(3);
+            int openBrace = matcher.end() - 1;
+            String structName = matcher.group(4);
 
-                for (int j = i + 1; j < lines.length && !done; j++) {
-                    String cur = lines[j];
-                    for (int k = 0; k < cur.length(); k++) {
-                        char c = cur.charAt(k);
-                        if (c == '{') {
-                            bracket++;
-                        } else if (c == '}') {
-                            bracket--;
-                            if (bracket == 0) {
-                                result.add(new Region(mStart, mEnd, mEnd + 1, lineStart + k + 1));
-                                done = true;
-                                break;
-                            }
-                        } else if (c == ';' && bracket == 0) {
-                            done = true;
-                            break;
-                        }
-                    }
-                    lineStart = lineStart + cur.length() + 1;
+            int closeBrace = findMatchingBrace(text, openBrace);
+            if (closeBrace != -1) {
+                int endPos = closeBrace + 1;
+                while (endPos < text.length() && Character.isWhitespace(text.charAt(endPos))) {
+                    endPos++;
                 }
+                if (endPos < text.length() && text.charAt(endPos) == ';') {
+                    endPos++;
+                }
+                regions.add(new Region(markerStart, structKeywordStart, endPos, structName));
+            }
+        }
+        return regions;
+    }
+
+    public static ArrayList<Region> find(String text, String marker) {
+        if ("@padding".equals(marker)) {
+            return new ArrayList<>();
+        }
+        return findAllStructs(text);
+    }
+
+    private static int findMatchingBrace(String text, int openBraceIdx) {
+        int depth = 0;
+        boolean inLineComment = false;
+        boolean inBlockComment = false;
+        boolean inString = false;
+
+        for (int i = openBraceIdx; i < text.length(); i++) {
+            char c = text.charAt(i);
+            char next = (i + 1 < text.length()) ? text.charAt(i + 1) : '\0';
+
+            if (inLineComment) {
+                if (c == '\n') inLineComment = false;
+                continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && next == '/') {
+                    inBlockComment = false;
+                    i++;
+                }
+                continue;
+            }
+            if (inString) {
+                if (c == '\\') {
+                    i++;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
             }
 
-            pos = pos + lines[i].length() + 1;
+            if (c == '/' && next == '/') {
+                inLineComment = true;
+                i++;
+            } else if (c == '/' && next == '*') {
+                inBlockComment = true;
+                i++;
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
         }
-        return result;
+        return -1;
     }
 }
