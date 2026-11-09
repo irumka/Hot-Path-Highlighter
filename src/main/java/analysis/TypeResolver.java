@@ -37,7 +37,10 @@ public class TypeResolver {
 
     private static final Map<String, TypeInfo> CACHE = new ConcurrentHashMap<>();
 
-    private static final Pattern ARRAY_PATTERN = Pattern.compile("^(.*?)\\[(\\d+)\\]$");
+    private static final Pattern CONST_PATTERN = Pattern.compile("\\bconst\\b");
+    private static final Pattern VOLATILE_PATTERN = Pattern.compile("\\bvolatile\\b");
+    private static final Pattern WHITESPACE_PATTERN = Pattern.compile("\\s+");
+    private static final Pattern ARRAY_PATTERN = Pattern.compile("^(.*?)\\[(\\d+)\\]\\s*$");
     private static final Pattern ATOMIC_PATTERN = Pattern.compile("^(?:std::)?atomic<([^>]+)>$");
 
     public static void clearCache() {
@@ -72,9 +75,10 @@ public class TypeResolver {
                                           Map<String, int[]> customTypes) {
         boolean isWin = PlatformDetector.isWindows(effPlatform);
         boolean isMac = PlatformDetector.isMac(effPlatform);
+        int ptrSize = 8; // Стандартный 64-битный ABI указателя
 
         if (type.endsWith("*") || type.endsWith("&")) {
-            return new TypeInfo(8, 8);
+            return new TypeInfo(ptrSize, ptrSize);
         }
 
         Matcher atomicMatcher = ATOMIC_PATTERN.matcher(type);
@@ -201,36 +205,37 @@ public class TypeResolver {
             case "__m512d":
                 return new TypeInfo(64, 64);
 
+            // Контейнеры STL динамически масштабируются от ptrSize
             case "string":
             case "std::string":
-                return isMac ? new TypeInfo(24, 8) : new TypeInfo(32, 8);
+                return new TypeInfo(isMac ? 3 * ptrSize : 4 * ptrSize, ptrSize);
 
             case "string_view":
             case "std::string_view":
-                return new TypeInfo(16, 8);
+                return new TypeInfo(2 * ptrSize, ptrSize);
 
             case "vector":
             case "std::vector":
-                return new TypeInfo(24, 8);
+                return new TypeInfo(3 * ptrSize, ptrSize);
 
             case "unique_ptr":
             case "std::unique_ptr":
-                return new TypeInfo(8, 8);
+                return new TypeInfo(ptrSize, ptrSize);
 
             case "shared_ptr":
             case "std::shared_ptr":
-                return new TypeInfo(16, 8);
+                return new TypeInfo(2 * ptrSize, ptrSize);
 
             default:
-                return new TypeInfo(8, 8);
+                return new TypeInfo(ptrSize, ptrSize);
         }
     }
 
     private static String normalizeType(String type) {
-        return type.trim()
-                .replaceAll("\\bconst\\b", "")
-                .replaceAll("\\bvolatile\\b", "")
-                .replaceAll("\\s+", " ")
-                .trim();
+        if (type == null) return "";
+        String t = CONST_PATTERN.matcher(type).replaceAll("");
+        t = VOLATILE_PATTERN.matcher(t).replaceAll("");
+        t = WHITESPACE_PATTERN.matcher(t).replaceAll(" ");
+        return t.trim();
     }
 }

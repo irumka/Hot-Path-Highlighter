@@ -14,6 +14,7 @@ import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiFile;
+import com.intellij.util.Alarm;
 import core.FalseSharingDetector;
 import core.GlobalAtomicsAudit;
 import core.ProducerConsumerAnalyzer;
@@ -28,8 +29,12 @@ import java.util.List;
 /**
  * Main plugin engine: Memory map rendering, Interactive Hover Tooltip Inspector,
  * Zero-Alloc linting, Cache line splits, and Global Atomics Audit.
+ * Incorporates an EDT debounce alarm to prevent UI freezes.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
+
+    private static final Alarm UPDATE_ALARM = new Alarm(Alarm.ThreadToUse.SWING_THREAD);
+    private static final int DEBOUNCE_DELAY_MS = 250;
 
     public HotPathHighlighter() {
     }
@@ -92,9 +97,12 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
     public static void update(Editor ed) {
         if (ed == null || ed.isDisposed()) return;
-        ApplicationManager.getApplication().invokeLater(() -> {
-            if (ed != null && !ed.isDisposed()) refresh(ed);
-        });
+        UPDATE_ALARM.cancelAllRequests();
+        UPDATE_ALARM.addRequest(() -> {
+            if (ed != null && !ed.isDisposed()) {
+                refresh(ed);
+            }
+        }, DEBOUNCE_DELAY_MS);
     }
 
     public static void refreshAllEditors() {
@@ -273,7 +281,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
             }
         }
 
-        // 1. Карта памяти (Bar Inlay)
         if (state.showMemoryMapBar && (state.cacheLineBoundaries || state.paddingVisualization)) {
             InlayProperties props = new InlayProperties();
             props.showAbove(true);
@@ -282,7 +289,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
             model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
         }
 
-        // 2. Статусный заголовок структуры
         String status;
         if (state.falseSharingDetection && !risky.isEmpty()) {
             status = "FALSE SHARING";
@@ -313,7 +319,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
         addHint(ed, doc.getLineEndOffset(headerLine), label.toString(), labelColor);
 
-        // 3. Строчные подсказки у полей
         boolean showAnyHints = state.showFieldOffsets || state.showPaddingBadges
                 || state.showSplitBadges || state.showFalseSharingBadges || state.showHotColdBadges;
 
@@ -332,7 +337,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     hint.append("off ").append(f.offset).append(", ").append(f.size).append("B");
                 }
 
-                // Cache Line Split
                 if (state.showSplitBadges && state.cacheLineBoundaries && f.size > 1) {
                     if (f.offset / lineSize != (f.offset + f.size - 1) / lineSize) {
                         hint.append(" [split]");
@@ -340,7 +344,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // Hot/Cold
                 if (state.showHotColdBadges && state.hotColdSeparation && hotColdMap != null) {
                     AccessPatternAnalyzer.FieldAnalysis fa = hotColdMap.get(f.name);
                     if (fa != null && fa.temperature == AccessPatternAnalyzer.Temperature.COLD) {
@@ -349,7 +352,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // Паддинг
                 if (state.showPaddingBadges && state.paddingVisualization) {
                     int fieldEnd = f.offset + f.size;
                     int nextOffset = (i + 1 < m.layout.fields.size()) ? m.layout.fields.get(i + 1).offset : m.layout.totalSize;
@@ -360,18 +362,17 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // False Sharing
                 String msg = risky.get(i);
                 if (state.showFalseSharingBadges && msg != null && state.falseSharingDetection) {
-                    if (msg.contains("Write-Write Ping-Pong")) {
+                    if (msg.contains("Array False Sharing")) {
+                        hint.append(" [array conflict]");
+                        color = Color.RED;
+                    } else if (msg.contains("Write-Write Ping-Pong")) {
                         hint.append(" [write ping-pong]");
                         color = Color.RED;
                     } else if (msg.contains("Read Invalidation")) {
                         hint.append(" [read invalidation]");
                         color = new Color(240, 110, 40);
-                    } else if (msg.contains("Array False Sharing")) {
-                        hint.append(" [array conflict]");
-                        color = Color.RED;
                     } else {
                         hint.append(" [conflict]");
                         color = Color.RED;

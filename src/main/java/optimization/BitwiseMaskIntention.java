@@ -15,11 +15,10 @@ import java.util.regex.Pattern;
 
 /**
  * Alt+Enter action: Replaces slow integer modulo '%' with bitwise '& (N - 1)'.
- * Eliminates 20-30 CPU cycle division penalties in ring buffer indexing.
+ * Validates power-of-two constraints to prevent silent code corruption.
  */
 public class BitwiseMaskIntention extends PsiElementBaseIntentionAction implements DumbAware, IntentionAction {
 
-    // Строго захватывает скобочное выражение или одиночный токен непосредственно перед '%'
     private static final Pattern MODULO_PATTERN = Pattern.compile(
             "(\\([a-zA-Z0-9_\\s+\\-*/%]+\\)|[a-zA-Z0-9_]+)\\s*%\\s*([a-zA-Z0-9_]+)"
     );
@@ -28,6 +27,10 @@ public class BitwiseMaskIntention extends PsiElementBaseIntentionAction implemen
     private int matchStart = -1;
     private int matchEnd = -1;
     private String leftExpr = null;
+
+    private static boolean isPowerOfTwo(long n) {
+        return n > 0 && (n & (n - 1)) == 0;
+    }
 
     @NotNull
     @Override
@@ -64,8 +67,20 @@ public class BitwiseMaskIntention extends PsiElementBaseIntentionAction implemen
             int absStart = lineStart + m.start();
             int absEnd = lineStart + m.end();
             if (offset >= absStart && offset <= absEnd + 5) {
+                String candidateDivisor = m.group(2).trim();
+
+                // Защита от порчи семантики: проверяем целочисленные литералы
+                try {
+                    long val = Long.decode(candidateDivisor);
+                    if (!isPowerOfTwo(val)) {
+                        return false; // Запрещаем для 100, 10, 60 и любых чисел != 2^N
+                    }
+                } catch (NumberFormatException ignored) {
+                    // Символическая константа (например BUFFER_SIZE) допустима
+                }
+
                 this.leftExpr = m.group(1).trim();
-                this.targetDivisor = m.group(2).trim();
+                this.targetDivisor = candidateDivisor;
                 this.matchStart = absStart;
                 this.matchEnd = absEnd;
                 return true;

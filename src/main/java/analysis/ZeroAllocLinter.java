@@ -27,7 +27,8 @@ public class ZeroAllocLinter {
     }
 
     private static final Pattern ALLOC_PATTERN = Pattern.compile(
-            "\\b(new\\s+[a-zA-Z0-9_:]+|malloc\\s*\\(|calloc\\s*\\(|realloc\\s*\\(|aligned_alloc\\s*\\(|posix_memalign\\s*\\(|std::make_unique|std::make_shared)\\b"
+            "\\b(new\\s+[a-zA-Z0-9_:]+|malloc\\s*\\(|calloc\\s*\\(|realloc\\s*\\(|" +
+                    "aligned_alloc\\s*\\(|posix_memalign\\s*\\(|std::make_unique|std::make_shared)\\b"
     );
 
     @NotNull

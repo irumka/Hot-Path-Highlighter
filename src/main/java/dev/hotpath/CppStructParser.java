@@ -5,6 +5,7 @@ import java.util.ArrayList;
 /**
  * Lightweight text parser for C++ structs and classes.
  * Preserves raw declarations, inline and preceding comments for refactoring.
+ * Correctly accounts for template brackets <...> and parentheses when finding statement ends.
  */
 public class CppStructParser {
 
@@ -81,6 +82,7 @@ public class CppStructParser {
             bodyEnd = cleared.length();
         }
         int depth = 0;
+        int angleDepth = 0;
         int stmtStart = bodyStart;
         StringBuilder stmt = new StringBuilder();
         int prevFieldEnd = bodyStart;
@@ -97,14 +99,23 @@ public class CppStructParser {
                     continue;
                 }
                 depth++;
-            } else if (c == '}' || c == '(' || c == '[') {
-                if (c != '}') depth++; else depth--;
+            } else if (c == '}') {
+                depth--;
+            } else if (c == '(' || c == '[') {
+                depth++;
             } else if (c == ')' || c == ']') {
                 depth--;
+            } else if (c == '<') {
+                angleDepth++;
+            } else if (c == '>') {
+                if (angleDepth > 0) angleDepth--;
             }
+
             if (depth < 0) depth = 0;
             stmt.append(c);
-            if (depth == 0 && c == ';') {
+
+            // Точка с запятой является концом декларации только вне скобок и шаблонов
+            if (depth == 0 && angleDepth == 0 && c == ';') {
                 String rawStmt = regionText.substring(stmtStart, Math.min(i + 1, regionText.length()));
                 Field f = addStatement(info, stmt.toString(), rawStmt, stmtStart, i, regionText, prevFieldEnd);
                 if (f != null) {

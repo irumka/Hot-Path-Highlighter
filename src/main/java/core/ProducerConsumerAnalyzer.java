@@ -10,7 +10,7 @@ import java.util.regex.Pattern;
 
 /**
  * Context-aware concurrency and access-pattern analyzer.
- * Distinguishes true multi-threaded hot-path structures from single-threaded orchestrators (Control Plane).
+ * Uses robust brace-depth matching to parse method bodies with arbitrary control flow (if/for/while).
  */
 public class ProducerConsumerAnalyzer {
 
@@ -78,20 +78,27 @@ public class ProducerConsumerAnalyzer {
         }
     }
 
-    private static final Pattern METHOD_PATTERN = Pattern.compile(
-            "(?:[a-zA-Z_0-9:<>&*]+\\s+)+([a-zA-Z_0-9]+)\\s*\\([^)]*\\)\\s*(?:const)?\\s*\\{([^}]+)\\}",
-            Pattern.MULTILINE
+    public static class ExtractedMethod {
+        public final String name;
+        public final String body;
+
+        public ExtractedMethod(String name, String body) {
+            this.name = name;
+            this.body = body;
+        }
+    }
+
+    private static final Pattern METHOD_SIG_PATTERN = Pattern.compile(
+            "(?:[a-zA-Z_0-9:<>&*]+\\s+)+([a-zA-Z_0-9]+)\\s*\\([^)]*\\)\\s*(?:const)?\\s*\\{"
     );
 
     private static final Pattern ARRAY_DECL_PATTERN = Pattern.compile("\\[(\\d+)\\]");
 
-    // Имена многопоточных контейнеров, очередей и тестовых структур конкуренции
     private static final Pattern QUEUE_NAME_PATTERN = Pattern.compile(
             ".*(queue|ringbuffer|ring_buffer|spsc|mpmc|spmc|mpsc|channel|disruptor|mailbox|worker|pool|pingpong|ping_pong|ping|invalidation|producer|consumer|concurrent).*",
             Pattern.CASE_INSENSITIVE
     );
 
-    // Имена классов-оркестраторов (Control Plane)
     private static final Pattern ORCHESTRATOR_PATTERN = Pattern.compile(
             ".*(manager|orchestrator|config|context|builder|factory|registry|service).*",
             Pattern.CASE_INSENSITIVE
@@ -139,17 +146,14 @@ public class ProducerConsumerAnalyzer {
             profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount));
         }
 
-        // Анализ чтения и записи в методах
-        Matcher matcher = METHOD_PATTERN.matcher(structBlockText);
-        while (matcher.find()) {
-            String methodName = matcher.group(1);
-            String methodBody = matcher.group(2);
-
+        // Итеративно извлекаем методы с корректным балансом фигурных скобок {}
+        List<ExtractedMethod> methods = extractMethods(structBlockText);
+        for (ExtractedMethod method : methods) {
             for (CppStructParser.Field field : info.fields) {
                 FieldProfile fp = profile.fields.get(field.name);
                 if (fp == null) continue;
 
-                analyzeFieldUsageInMethod(methodName, methodBody, fp);
+                analyzeFieldUsageInMethod(method.name, method.body, fp);
             }
         }
 
@@ -171,7 +175,6 @@ public class ProducerConsumerAnalyzer {
             }
         }
 
-        // Если разные методы пишут в разные поля или один метод пишет, а другой читает — структура многопоточная
         if (profile.concurrencyModel != ConcurrencyModel.CONTROL_PLANE) {
             if (writeFieldCount >= 2 || (writeFieldCount >= 1 && readFieldCount >= 1)) {
                 profile.concurrencyModel = ConcurrencyModel.QUEUE_OR_RINGBUFFER;
@@ -186,17 +189,51 @@ public class ProducerConsumerAnalyzer {
         return profile;
     }
 
+    @NotNull
+    private static List<ExtractedMethod> extractMethods(@NotNull String structBlock) {
+        List<ExtractedMethod> methods = new ArrayList<>();
+        Matcher matcher = METHOD_SIG_PATTERN.matcher(structBlock);
+
+        while (matcher.find()) {
+            String methodName = matcher.group(1);
+            int openBracePos = matcher.end() - 1;
+            int closeBracePos = findMatchingCloseBrace(structBlock, openBracePos);
+
+            if (closeBracePos > openBracePos) {
+                String body = structBlock.substring(openBracePos + 1, closeBracePos);
+                methods.add(new ExtractedMethod(methodName, body));
+            }
+        }
+        return methods;
+    }
+
+    private static int findMatchingCloseBrace(@NotNull String text, int openPos) {
+        int depth = 0;
+        for (int i = openPos; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
     private static void analyzeFieldUsageInMethod(String methodName, String body, FieldProfile fp) {
-        String fieldName = Pattern.quote(fp.name);
+        String quotedField = Pattern.quote(fp.name);
 
         Pattern writePattern = Pattern.compile(
-                "\\b" + fieldName + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
+                "\\b" + quotedField + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
                 Pattern.MULTILINE
         );
-        Pattern prefixIncPattern = Pattern.compile("(?:\\+\\+|--)\\s*" + fieldName + "\\b");
+        Pattern prefixIncPattern = Pattern.compile("(?:\\+\\+|--)\\s*" + quotedField + "\\b");
 
         boolean isWrite = writePattern.matcher(body).find() || prefixIncPattern.matcher(body).find();
-        Pattern readPattern = Pattern.compile("\\b" + fieldName + "\\b");
+        Pattern readPattern = Pattern.compile("\\b" + quotedField + "\\b");
         boolean isMentioned = readPattern.matcher(body).find();
 
         if (isWrite) {
