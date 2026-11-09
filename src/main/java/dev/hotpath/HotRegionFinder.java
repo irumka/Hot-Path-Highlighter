@@ -5,9 +5,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Finds C++ struct and class regions in text automatically.
- * Supports standard, aligned and final definitions:
- * 'struct Foo', 'struct alignas(64) Foo', 'class Bar final : public Base'.
+ * Finds C++ struct, class, and union regions in text automatically.
+ * Supports template structs, aligned definitions, unions, and final classes:
+ * 'template <typename T> struct Foo', 'union Bar', 'class alignas(32) Baz final'.
  */
 public class HotRegionFinder {
 
@@ -42,7 +42,11 @@ public class HotRegionFinder {
     }
 
     private static final Pattern STRUCT_PATTERN = Pattern.compile(
-            "((?://\\s*@(padding|p)[^\\n]*\\n\\s*)|(?:alignas\\s*\\([^)]*\\)\\s*))*\\b(struct|class)\\s+(?:alignas\\s*\\([^)]*\\)\\s+|(?:\\[\\[[^\\]]*\\]\\]\\s+)?)*([a-zA-Z_0-9]+)\\s*(?:final\\s*)?(?::\\s*[^{]+)?\\{",
+            "(?:template\\s*<[^>]*>\\s*)?" +
+                    "((?://\\s*@(padding|p)[^\\n]*\\n\\s*)|(?:alignas\\s*\\([^)]*\\)\\s*))*" +
+                    "\\b(struct|class|union)\\s+" +
+                    "(?:alignas\\s*\\([^)]*\\)\\s+|(?:\\[\\[[^\\]]*\\]\\]\\s+)?)*" +
+                    "([a-zA-Z_0-9]+)\\s*(?:final\\s*)?(?::\\s*[^{]+)?\\{",
             Pattern.MULTILINE
     );
 

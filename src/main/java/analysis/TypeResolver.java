@@ -70,12 +70,16 @@ public class TypeResolver {
         return info;
     }
 
+    private static boolean isPowerOfTwo(int n) {
+        return n > 0 && (n & (n - 1)) == 0;
+    }
+
     private static TypeInfo resolveDirect(String type,
                                           PlatformDetector.TargetPlatform effPlatform,
                                           Map<String, int[]> customTypes) {
         boolean isWin = PlatformDetector.isWindows(effPlatform);
         boolean isMac = PlatformDetector.isMac(effPlatform);
-        int ptrSize = 8; // Стандартный 64-битный ABI указателя
+        int ptrSize = 8;
 
         if (type.endsWith("*") || type.endsWith("&")) {
             return new TypeInfo(ptrSize, ptrSize);
@@ -85,7 +89,13 @@ public class TypeResolver {
         if (atomicMatcher.find()) {
             String innerType = atomicMatcher.group(1).trim();
             TypeInfo inner = resolve(innerType, effPlatform, customTypes);
-            return new TypeInfo(inner.size, inner.size, true);
+
+            // Выравнивание std::atomic<T>: не менее выравнивания T, а для степеней двойки до 16B - размер
+            int atomicAlign = inner.align;
+            if (isPowerOfTwo(inner.size) && inner.size <= 16) {
+                atomicAlign = Math.max(atomicAlign, inner.size);
+            }
+            return new TypeInfo(inner.size, atomicAlign, true);
         }
 
         Matcher arrayMatcher = ARRAY_PATTERN.matcher(type);
@@ -205,7 +215,6 @@ public class TypeResolver {
             case "__m512d":
                 return new TypeInfo(64, 64);
 
-            // Контейнеры STL динамически масштабируются от ptrSize
             case "string":
             case "std::string":
                 return new TypeInfo(isMac ? 3 * ptrSize : 4 * ptrSize, ptrSize);

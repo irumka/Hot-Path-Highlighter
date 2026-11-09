@@ -14,8 +14,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Alt+Enter action: Inserts _mm_pause() instruction into empty or tight spinloops.
- * Prevents CPU pipeline stalls and reduces core power consumption on hyper-threaded cores.
+ * Alt+Enter action: Inserts _mm_pause() instruction into spinloops.
+ * Preserves all existing code inside the loop body to prevent code corruption.
  */
 public class SpinloopPauseIntention extends PsiElementBaseIntentionAction implements DumbAware, IntentionAction {
 
@@ -43,8 +43,8 @@ public class SpinloopPauseIntention extends PsiElementBaseIntentionAction implem
         int offset = editor.getCaretModel().getOffset();
 
         int lineNum = document.getLineNumber(offset);
-        int startLine = Math.max(0, lineNum - 3);
-        int endLine = Math.min(document.getLineCount() - 1, lineNum + 3);
+        int startLine = Math.max(0, lineNum - 4);
+        int endLine = Math.min(document.getLineCount() - 1, lineNum + 4);
         int searchStart = document.getLineStartOffset(startLine);
         int searchEnd = document.getLineEndOffset(endLine);
         String snippet = text.substring(searchStart, searchEnd);
@@ -122,14 +122,32 @@ public class SpinloopPauseIntention extends PsiElementBaseIntentionAction implem
         if (editor == null || bodyStart == -1) return;
 
         Document document = editor.getDocument();
-        String replacement = " { _mm_pause(); }";
 
         WriteCommandAction.runWriteCommandAction(project, () -> {
-            document.replaceString(bodyStart, bodyEnd, replacement);
+            String existingBody = document.getText().substring(bodyStart, bodyEnd);
 
-            String text = document.getText();
-            if (!text.contains("<immintrin.h>")) {
-                int firstInclude = text.indexOf("#include");
+            if (existingBody.equals(";")) {
+                document.replaceString(bodyStart, bodyEnd, " { _mm_pause(); }");
+            } else if (existingBody.trim().equals("{}")) {
+                document.replaceString(bodyStart, bodyEnd, " { _mm_pause(); }");
+            } else {
+                int openBraceIdx = existingBody.indexOf('{');
+                if (openBraceIdx != -1) {
+                    int insertPos = bodyStart + openBraceIdx + 1;
+                    int lineNum = document.getLineNumber(insertPos);
+                    int lineStart = document.getLineStartOffset(lineNum);
+                    String lineText = document.getText().substring(lineStart, insertPos);
+                    int ws = 0;
+                    while (ws < lineText.length() && Character.isWhitespace(lineText.charAt(ws))) ws++;
+                    String indent = lineText.substring(0, ws);
+                    String pauseInsert = "\n" + indent + "    _mm_pause();";
+                    document.insertString(insertPos, pauseInsert);
+                }
+            }
+
+            String currentText = document.getText();
+            if (!currentText.contains("<immintrin.h>")) {
+                int firstInclude = currentText.indexOf("#include");
                 if (firstInclude != -1) {
                     document.insertString(firstInclude, "#include <immintrin.h>\n");
                 } else {

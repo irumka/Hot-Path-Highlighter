@@ -10,7 +10,8 @@ import java.util.regex.Pattern;
 
 /**
  * Detects latency-killing heap allocations on critical execution paths:
- * new, malloc, calloc, realloc, posix_memalign, aligned_alloc, std::make_unique.
+ * new, new[], placement new, operator new, malloc, calloc, realloc,
+ * posix_memalign, aligned_alloc, std::make_unique, std::make_shared.
  */
 public class ZeroAllocLinter {
 
@@ -27,8 +28,9 @@ public class ZeroAllocLinter {
     }
 
     private static final Pattern ALLOC_PATTERN = Pattern.compile(
-            "\\b(new\\s+[a-zA-Z0-9_:]+|malloc\\s*\\(|calloc\\s*\\(|realloc\\s*\\(|" +
-                    "aligned_alloc\\s*\\(|posix_memalign\\s*\\(|std::make_unique|std::make_shared)\\b"
+            "(?:\\b(?:new\\s*[\\[\\(]|new\\s+[a-zA-Z0-9_:]+|operator\\s+new\\b)|" +
+                    "\\b(?:malloc|calloc|realloc|aligned_alloc|posix_memalign)\\s*\\(|" +
+                    "\\b(?:std::)?(?:make_unique|make_shared)\\b)"
     );
 
     @NotNull
@@ -37,7 +39,7 @@ public class ZeroAllocLinter {
         Matcher m = ALLOC_PATTERN.matcher(structBlockText);
 
         while (m.find()) {
-            String kw = m.group(1).trim();
+            String kw = m.group().trim();
             int absOffset = regionStartOffset + m.start();
             hazards.add(new AllocationHazard(
                     absOffset,

@@ -25,6 +25,7 @@ import java.util.regex.Pattern;
 /**
  * Alt+Enter action: Fixes Array False Sharing in thread pools / worker arrays
  * by aligning the element struct definition to 64 bytes (1 cache line per core).
+ * Supports template structs like WorkerCtx<T>.
  */
 public class ArrayFalseSharingFixerIntention extends PsiElementBaseIntentionAction implements DumbAware, IntentionAction {
 
@@ -123,14 +124,15 @@ public class ArrayFalseSharingFixerIntention extends PsiElementBaseIntentionActi
             if (targetField == null) return;
 
             String elemType = targetField.type.trim();
+            String baseElemType = extractBaseTypeName(elemType);
 
             for (HotRegionFinder.Region targetReg : regions) {
-                if (targetReg.name().equals(elemType)) {
+                if (targetReg.name().equals(baseElemType) || targetReg.name().equals(elemType)) {
                     int openBrace = text.indexOf('{', targetReg.bStart());
                     if (openBrace == -1) openBrace = Math.min(targetReg.bStart() + 100, text.length());
                     String header = text.substring(targetReg.bStart(), openBrace);
 
-                    Pattern kwPattern = Pattern.compile("\\b(struct|class)\\b");
+                    Pattern kwPattern = Pattern.compile("\\b(struct|class|union)\\b");
                     Matcher kwMatcher = kwPattern.matcher(header);
                     if (kwMatcher.find()) {
                         int insertPos = targetReg.bStart() + kwMatcher.end();
@@ -150,6 +152,19 @@ public class ArrayFalseSharingFixerIntention extends PsiElementBaseIntentionActi
             });
             return;
         }
+    }
+
+    private static String extractBaseTypeName(String rawType) {
+        String base = rawType.trim();
+        int lt = base.indexOf('<');
+        if (lt != -1) {
+            base = base.substring(0, lt).trim();
+        }
+        int sc = base.lastIndexOf("::");
+        if (sc != -1) {
+            base = base.substring(sc + 2).trim();
+        }
+        return base;
     }
 
     @Override

@@ -13,6 +13,10 @@ public class LayoutCalculator {
     private LayoutCalculator() {
     }
 
+    public static class ConflictHolder {
+        public static int conflicts;
+    }
+
     public static class Gap {
         public int from;
         public int to;
@@ -37,6 +41,7 @@ public class LayoutCalculator {
         public ArrayList<String> notes = new ArrayList<>();
         public int[] cells;
         public int cacheLines;
+        public int conflicts = 0;
         public int score = -1;
     }
 
@@ -208,7 +213,7 @@ public class LayoutCalculator {
             l.wasted = Math.max(0, l.totalSize - sum);
             l.cacheLines = (l.totalSize + st.cacheLine() - 1) / st.cacheLine();
             makeCells(l);
-            l.score = healthScore(l, st);
+            l.score = healthScore(l, st, l.conflicts);
         }
     }
 
@@ -234,7 +239,7 @@ public class LayoutCalculator {
         l.cells = cells;
     }
 
-    public static int healthScore(Layout l, HotPathSettings st) {
+    public static int healthScore(Layout l, HotPathSettings st, int conflicts) {
         int s = 100;
         if (l.totalSize > 0) {
             double waste = (double) l.wasted / l.totalSize;
@@ -242,12 +247,12 @@ public class LayoutCalculator {
         }
         s -= Math.max(0, l.cacheLines - 1) * 8;
         s -= l.unknown.size() * 25;
-        s -= ConflictHolder.conflicts * 15;
+        s -= Math.max(0, conflicts) * 15;
         return Math.max(0, s);
     }
 
-    static class ConflictHolder {
-        static int conflicts;
+    public static int healthScore(Layout l, HotPathSettings st) {
+        return healthScore(l, st, l.conflicts);
     }
 
     static String baseName(String t) {

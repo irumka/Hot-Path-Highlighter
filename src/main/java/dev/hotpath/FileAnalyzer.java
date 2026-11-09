@@ -131,7 +131,8 @@ public class FileAnalyzer {
             }
 
             LayoutCalculator.ConflictHolder.conflicts = detectorResult.conflicts.size();
-            m.layout.score = LayoutCalculator.healthScore(m.layout, HotPathSettings.get());
+            m.layout.conflicts = detectorResult.conflicts.size();
+            m.layout.score = LayoutCalculator.healthScore(m.layout, HotPathSettings.get(), m.layout.conflicts);
             m.fieldEnds = new int[l.fields.size()];
             for (int k = 0; k < l.fields.size(); k++) {
                 m.fieldEnds[k] = reg.bStart() + l.fields.get(k).end;
