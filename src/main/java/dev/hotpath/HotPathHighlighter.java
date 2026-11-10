@@ -4,6 +4,8 @@ import analysis.*;
 import com.intellij.codeInsight.hint.HintManager;
 import com.intellij.codeInsight.intention.IntentionAction;
 import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.openapi.application.ModalityState;
+import com.intellij.openapi.application.ReadAction;
 import com.intellij.openapi.editor.*;
 import com.intellij.openapi.editor.colors.EditorFontType;
 import com.intellij.openapi.editor.event.*;
@@ -14,6 +16,7 @@ import com.intellij.openapi.util.Disposer;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.psi.PsiFile;
 import com.intellij.util.Alarm;
+import com.intellij.util.concurrency.AppExecutorUtil;
 import core.FalseSharingDetector;
 import core.GlobalAtomicsAudit;
 import core.ProducerConsumerAnalyzer;
@@ -24,14 +27,16 @@ import java.awt.*;
 import java.awt.geom.Rectangle2D;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Main plugin engine: Memory map rendering, Interactive Hover Tooltip Inspector,
- * STLF / 4K Aliasing, Misaligned Allocators, Zero-Alloc, and SIMD Crash Guard.
+ * Zero-Alloc linting, Cache line splits, and Global Atomics Audit.
+ * Performs all heavy static analysis asynchronously off the EDT via nonBlocking ReadActions.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
 
-    private static final Alarm UPDATE_ALARM = new Alarm(Alarm.ThreadToUse.SWING_THREAD);
+    private static final Map<Editor, Alarm> EDITOR_ALARMS = new ConcurrentHashMap<>();
     private static final int DEBOUNCE_DELAY_MS = 250;
 
     public HotPathHighlighter() {
@@ -65,6 +70,11 @@ public class HotPathHighlighter implements EditorFactoryListener {
     @Override
     public void editorReleased(@NotNull EditorFactoryEvent event) {
         Editor ed = event.getEditor();
+        Alarm alarm = EDITOR_ALARMS.remove(ed);
+        if (alarm != null) {
+            alarm.cancelAllRequests();
+            Disposer.dispose(alarm);
+        }
         if (ed.getDocument() != null) {
             removeOldHints(ed, ed.getDocument().getTextLength());
             removeOldBars(ed, ed.getDocument().getTextLength());
@@ -93,10 +103,11 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
     public static void update(Editor ed) {
         if (ed == null || ed.isDisposed()) return;
-        UPDATE_ALARM.cancelAllRequests();
-        UPDATE_ALARM.addRequest(() -> {
-            if (ed != null && !ed.isDisposed()) {
-                refresh(ed);
+        Alarm alarm = EDITOR_ALARMS.computeIfAbsent(ed, k -> new Alarm(Alarm.ThreadToUse.SWING_THREAD));
+        alarm.cancelAllRequests();
+        alarm.addRequest(() -> {
+            if (!ed.isDisposed()) {
+                scheduleBackgroundRefresh(ed);
             }
         }, DEBOUNCE_DELAY_MS);
     }
@@ -105,9 +116,98 @@ public class HotPathHighlighter implements EditorFactoryListener {
         ApplicationManager.getApplication().invokeLater(() -> {
             Editor[] editors = EditorFactory.getInstance().getAllEditors();
             for (Editor editor : editors) {
-                if (!editor.isDisposed()) refresh(editor);
+                if (!editor.isDisposed()) {
+                    update(editor);
+                }
             }
         });
+    }
+
+    private static class BackgroundAnalysisPayload {
+        final String text;
+        final FileAnalyzer.Result result;
+        final List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues;
+        final Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps;
+        final List<GlobalAtomicsAudit.AuditConflict> globalConflicts;
+
+        BackgroundAnalysisPayload(String text, FileAnalyzer.Result result,
+                                  List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues,
+                                  Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps,
+                                  List<GlobalAtomicsAudit.AuditConflict> globalConflicts) {
+            this.text = text;
+            this.result = result;
+            this.allocIssues = allocIssues;
+            this.hotColdMaps = hotColdMaps;
+            this.globalConflicts = globalConflicts;
+        }
+    }
+
+    private static void scheduleBackgroundRefresh(Editor ed) {
+        if (ed.isDisposed()) return;
+
+        ReadAction.nonBlocking(() -> {
+                    if (ed.isDisposed()) return null;
+                    String text = ed.getDocument().getText();
+                    HFTSettings.State state = HFTSettings.getInstance().getState();
+                    if (state.autoEnableCpp && !isCppFile(ed)) return null;
+
+                    FileAnalyzer.Result result;
+                    try {
+                        result = FileAnalyzer.analyze(text);
+                    } catch (Exception e) {
+                        return null;
+                    }
+                    if (result == null || result.structs == null) return null;
+
+                    List<CppStructParser.StructInfo> allInfos = new ArrayList<>();
+                    for (FileAnalyzer.MarkedStruct m : result.structs) {
+                        if (m.info != null) allInfos.add(m.info);
+                    }
+
+                    List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues =
+                            state.misalignedAllocatorDetection ? MisalignedAllocatorDetector.checkFile(text, allInfos) : Collections.emptyList();
+
+                    Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps = new HashMap<>();
+                    for (FileAnalyzer.MarkedStruct m : result.structs) {
+                        try {
+                            Map<String, AccessPatternAnalyzer.FieldAnalysis> map = ensureCellsAndConflicts(m, text, state);
+                            hotColdMaps.put(m, map);
+                        } catch (Exception ignored) {}
+                    }
+
+                    List<GlobalAtomicsAudit.AuditConflict> globalConflicts = state.globalAtomicsAudit
+                            ? GlobalAtomicsAudit.audit(text, state.cacheLineSize)
+                            : Collections.emptyList();
+
+                    return new BackgroundAnalysisPayload(text, result, allocIssues, hotColdMaps, globalConflicts);
+                })
+                .expireWhen(ed::isDisposed)
+                .finishOnUiThread(ModalityState.any(), payload -> {
+                    if (ed.isDisposed() || payload == null) return;
+                    applyHighlights(ed, payload);
+                })
+                .submit(AppExecutorUtil.getAppExecutorService());
+    }
+
+    private static void applyHighlights(Editor ed, BackgroundAnalysisPayload payload) {
+        String text = payload.text;
+        removeOldHints(ed, text.length());
+        removeOldBars(ed, text.length());
+
+        HFTSettings.State state = HFTSettings.getInstance().getState();
+
+        for (FileAnalyzer.MarkedStruct m : payload.result.structs) {
+            try {
+                Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap = payload.hotColdMaps.get(m);
+                drawMarkedStruct(ed, m, state, hotColdMap, payload.allocIssues);
+            } catch (Exception ignored) {}
+        }
+
+        for (GlobalAtomicsAudit.AuditConflict gc : payload.globalConflicts) {
+            int lineNum = ed.getDocument().getLineNumber(gc.second.offsetInDoc);
+            int lineEnd = ed.getDocument().getLineEndOffset(lineNum);
+            addHint(ed, lineEnd, " [potential global false sharing: contiguous in .bss/.data]", Color.RED);
+        }
     }
 
     public static void removeOldHints(Editor ed, int length) {
@@ -135,47 +235,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
         return lower.equals("cpp") || lower.equals("cxx") || lower.equals("cc")
                 || lower.equals("c") || lower.equals("h") || lower.equals("hpp")
                 || lower.equals("hxx");
-    }
-
-    static void refresh(Editor ed) {
-        String text = ed.getDocument().getText();
-        removeOldHints(ed, text.length());
-        removeOldBars(ed, text.length());
-
-        HFTSettings.State state = HFTSettings.getInstance().getState();
-        if (state.autoEnableCpp && !isCppFile(ed)) return;
-
-        FileAnalyzer.Result result;
-        try {
-            result = FileAnalyzer.analyze(text);
-        } catch (Exception e) {
-            return;
-        }
-        if (result == null || result.structs == null) return;
-
-        // Список всех структур файла для проверки Misaligned Allocators
-        List<CppStructParser.StructInfo> allInfos = new ArrayList<>();
-        for (FileAnalyzer.MarkedStruct m : result.structs) {
-            if (m.info != null) allInfos.add(m.info);
-        }
-        List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues =
-                state.misalignedAllocatorDetection ? MisalignedAllocatorDetector.checkFile(text, allInfos) : Collections.emptyList();
-
-        for (FileAnalyzer.MarkedStruct m : result.structs) {
-            try {
-                Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap = ensureCellsAndConflicts(m, text, state);
-                drawMarkedStruct(ed, m, state, hotColdMap, allocIssues);
-            } catch (Exception ignored) {}
-        }
-
-        if (state.globalAtomicsAudit) {
-            List<GlobalAtomicsAudit.AuditConflict> globalConflicts = GlobalAtomicsAudit.audit(text, state.cacheLineSize);
-            for (GlobalAtomicsAudit.AuditConflict gc : globalConflicts) {
-                int lineNum = ed.getDocument().getLineNumber(gc.second.offsetInDoc);
-                int lineEnd = ed.getDocument().getLineEndOffset(lineNum);
-                addHint(ed, lineEnd, " [potential global false sharing: contiguous in .bss/.data]", Color.RED);
-            }
-        }
     }
 
     static Map<String, AccessPatternAnalyzer.FieldAnalysis> ensureCellsAndConflicts(
@@ -268,7 +327,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
             }
         }
 
-        // 1. Memory Map Bar Inlay
         if (state.showMemoryMapBar && (state.cacheLineBoundaries || state.paddingVisualization)) {
             InlayProperties props = new InlayProperties();
             props.showAbove(true);
@@ -277,7 +335,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
             model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
         }
 
-        // 2. Детекторы кремниевых угроз
         boolean simdHazard = checkSimdHazard(m);
         boolean hasAllocMismatch = false;
         for (MisalignedAllocatorDetector.MisalignedContainerIssue issue : allocIssues) {
@@ -338,7 +395,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
         addHint(ed, doc.getLineEndOffset(headerLine), label.toString(), labelColor);
 
-        // 3. Строчные подсказки у полей
         boolean showAnyHints = state.showFieldOffsets || state.showPaddingBadges
                 || state.showSplitBadges || state.showFalseSharingBadges || state.showHotColdBadges;
 
@@ -361,7 +417,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // Cache Line Split
                 if (state.showSplitBadges && state.cacheLineBoundaries && f.size > 1 && !f.isBitfield) {
                     if (f.offset / lineSize != (f.offset + f.size - 1) / lineSize) {
                         hint.append(" [split]");
@@ -369,7 +424,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // Hot/Cold индикаторы
                 if (state.showHotColdBadges && hotColdMap != null) {
                     AccessPatternAnalyzer.FieldAnalysis fa = hotColdMap.get(f.name);
                     if (fa != null) {
@@ -383,7 +437,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // Паддинг
                 if (state.showPaddingBadges && state.paddingVisualization && !f.isBitfield) {
                     int fieldEnd = f.offset + f.size;
                     int nextOffset = (i + 1 < m.layout.fields.size()) ? m.layout.fields.get(i + 1).offset : m.layout.totalSize;
@@ -394,7 +447,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // False Sharing
                 String msg = risky.get(i);
                 if (state.showFalseSharingBadges && msg != null && state.falseSharingDetection) {
                     if (msg.contains("Array False Sharing")) {
@@ -412,7 +464,6 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
-                // STLF / 4K Aliasing подсказки у полей
                 for (StoreForwardingDetector.StlfHazard hazard : stlfHazards) {
                     if (hazard.loadField.name.equals(f.name)) {
                         if (hazard.type == StoreForwardingDetector.StlfHazardType.FOUR_K_ALIASING) {

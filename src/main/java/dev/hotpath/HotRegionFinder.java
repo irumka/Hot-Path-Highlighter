@@ -6,8 +6,8 @@ import java.util.regex.Pattern;
 
 /**
  * Finds C++ struct, class, and union regions in text automatically.
- * Supports template structs, aligned definitions, unions, and final classes:
- * 'template <typename T> struct Foo', 'union Bar', 'class alignas(32) Baz final'.
+ * Supports template structs, aligned definitions, unions, and final classes.
+ * Immune to catastrophic backtracking (ReDoS) and supports nested template arguments.
  */
 public class HotRegionFinder {
 
@@ -42,10 +42,10 @@ public class HotRegionFinder {
     }
 
     private static final Pattern STRUCT_PATTERN = Pattern.compile(
-            "(?:template\\s*<[^>]*>\\s*)?" +
+            "(?:template\\s*<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>\\s*)?" +
                     "((?://\\s*@(padding|p)[^\\n]*\\n\\s*)|(?:alignas\\s*\\([^)]*\\)\\s*))*" +
                     "\\b(struct|class|union)\\s+" +
-                    "(?:alignas\\s*\\([^)]*\\)\\s+|(?:\\[\\[[^\\]]*\\]\\]\\s+)?)*" +
+                    "(?:alignas\\s*\\([^)]*\\)\\s+|\\[\\[[^\\]]*\\]\\]\\s+)*" +
                     "([a-zA-Z_0-9]+)\\s*(?:final\\s*)?(?::\\s*[^{]+)?\\{",
             Pattern.MULTILINE
     );

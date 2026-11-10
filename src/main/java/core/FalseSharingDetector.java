@@ -39,7 +39,7 @@ public class FalseSharingDetector {
                           boolean isArray, int arrayCount) {
             this.name = name;
             this.offset = offset;
-            this.size = Math.max(1, size);
+            this.size = Math.max(0, size);
             int line = cacheLineSize > 0 ? cacheLineSize : 64;
             this.cacheLineIndex = offset / line;
             this.isAtomic = isAtomic;
@@ -50,7 +50,12 @@ public class FalseSharingDetector {
         }
 
         public int elementSize() {
-            return Math.max(1, size / arrayCount);
+            if (size <= 0 || arrayCount <= 0) return 0;
+            return size / arrayCount;
+        }
+
+        public boolean known() {
+            return size > 0;
         }
     }
 
@@ -92,11 +97,15 @@ public class FalseSharingDetector {
             return result;
         }
 
-        // 1. Детекция Array False Sharing
+        // 1. Детекция Array False Sharing с валидацией размера (отсекает size <= 0 и уже выровненные массивы >= lineSize)
         for (CacheField f : fields) {
+            if (!f.known() || f.size <= 0) {
+                continue;
+            }
+
             if (f.isArray && f.arrayCount > 1) {
                 int elemSize = f.elementSize();
-                if (elemSize < lineSize) {
+                if (elemSize > 0 && elemSize < lineSize && (f.isAtomic || profile.hasAtomicsOrLocks)) {
                     Conflict c = new Conflict(f, f, f.cacheLineIndex, HazardLevel.ARRAY_HAZARD,
                             "Array False Sharing: worker elements (" + elemSize + "B) share cache lines");
                     result.conflicts.add(c);
@@ -108,13 +117,15 @@ public class FalseSharingDetector {
         // 2. Межполевой анализ с проверкой диапазона линий
         for (int i = 0; i < fields.size(); i++) {
             CacheField f1 = fields.get(i);
+            if (!f1.known()) continue;
             int f1Start = f1.offset / lineSize;
-            int f1End = (f1.offset + f1.size - 1) / lineSize;
+            int f1End = (f1.offset + Math.max(1, f1.size) - 1) / lineSize;
 
             for (int j = i + 1; j < fields.size(); j++) {
                 CacheField f2 = fields.get(j);
+                if (!f2.known()) continue;
                 int f2Start = f2.offset / lineSize;
-                int f2End = (f2.offset + f2.size - 1) / lineSize;
+                int f2End = (f2.offset + Math.max(1, f2.size) - 1) / lineSize;
 
                 boolean sharesLine = f1Start <= f2End && f2Start <= f1End;
                 if (!sharesLine) {

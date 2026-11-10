@@ -1,18 +1,16 @@
 package dev.hotpath;
 
 import java.awt.Color;
-import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Configuration settings for the Hot Path Highlighter. Provides ABI-specific
- * sizes, feature toggles and colors. Fields are public for direct access from
- * CppTypeResolver, while getter methods with the same names serve
- * LayoutCalculator and MemoryMapRenderer.
+ * Configuration settings for the Hot Path Highlighter.
+ * Thread-safe concurrent custom sizes and ABI parameters.
  */
 public class HotPathSettings {
     private static final HotPathSettings INSTANCE = new HotPathSettings();
 
-    // ABI sizes, defaults match the 64-bit System V / Linux ABI.
     public int pointerSize = 8;
     public int longSize = 8;
     public int longDoubleSize = 16;
@@ -28,17 +26,14 @@ public class HotPathSettings {
     private boolean hotAuto = true;
     private int palette = 0;
 
-    private final HashMap<String, int[]> customSizes = new HashMap<>();
+    private final Map<String, int[]> customSizes = new ConcurrentHashMap<>();
 
     private HotPathSettings() {
     }
 
-    /** Global settings instance. */
     public static HotPathSettings get() {
         return INSTANCE;
     }
-
-    // --- Method accessors used by LayoutCalculator / MemoryMapRenderer ---
 
     public int pointerSize() {
         return pointerSize;
@@ -63,8 +58,6 @@ public class HotPathSettings {
     public Color falseShareColor() {
         return new Color(255, 90, 60, 200);
     }
-
-    // --- Feature toggles ---
 
     public boolean falseSharingOn() {
         return falseSharing;
@@ -98,23 +91,10 @@ public class HotPathSettings {
         hotAuto = on;
     }
 
-    // --- Custom type database ---
-
-    /**
-     * Looks up a user-defined size and alignment for a type.
-     * @param type type name
-     * @return {size, align, atomicFlag} or null when not customized
-     */
     public int[] customSize(String type) {
         return customSizes.get(type);
     }
 
-    /**
-     * Registers a user-defined size and alignment for a type.
-     * @param type  type name
-     * @param size  size in bytes
-     * @param align alignment in bytes
-     */
     public void setCustomSize(String type, int size, int align) {
         customSizes.put(type, new int[]{size, align, 0});
     }

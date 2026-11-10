@@ -10,8 +10,7 @@ import java.util.regex.Pattern;
 
 /**
  * Robust concurrency and access-pattern analyzer.
- * Robustly parses complex C++ method signatures with default arguments,
- * noexcept, trailing return types, and nested template arguments.
+ * Pre-compiles field access patterns to minimize GC overhead and parse complex C++ method bodies.
  */
 public class ProducerConsumerAnalyzer {
 
@@ -147,13 +146,41 @@ public class ProducerConsumerAnalyzer {
             profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount));
         }
 
-        // Парсинг методов без падений на сложных шаблонах и скобках
+        // Прекомпиляция регулярных выражений: ровно 1 раз на поле (сложность O(F) вместо O(M * F))
+        Map<String, Pattern> writePatterns = new HashMap<>();
+        Map<String, Pattern> prefixIncPatterns = new HashMap<>();
+        Map<String, Pattern> readPatterns = new HashMap<>();
+
+        for (CppStructParser.Field field : info.fields) {
+            String quotedField = Pattern.quote(field.name);
+            writePatterns.put(field.name, Pattern.compile(
+                    "\\b" + quotedField + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
+                    Pattern.MULTILINE
+            ));
+            prefixIncPatterns.put(field.name, Pattern.compile("(?:\\+\\+|--)\\s*" + quotedField + "\\b"));
+            readPatterns.put(field.name, Pattern.compile("\\b" + quotedField + "\\b"));
+        }
+
         List<ExtractedMethod> methods = extractMethods(structBlockText);
         for (ExtractedMethod method : methods) {
             for (CppStructParser.Field field : info.fields) {
                 FieldProfile fp = profile.fields.get(field.name);
                 if (fp == null) continue;
-                analyzeFieldUsageInMethod(method.name, method.body, fp);
+
+                String body = method.body;
+                Pattern wp = writePatterns.get(field.name);
+                Pattern pip = prefixIncPatterns.get(field.name);
+                Pattern rp = readPatterns.get(field.name);
+
+                boolean isWrite = (wp != null && wp.matcher(body).find()) ||
+                        (pip != null && pip.matcher(body).find());
+                boolean isMentioned = (rp != null && rp.matcher(body).find());
+
+                if (isWrite) {
+                    fp.writerMethods.add(method.name);
+                } else if (isMentioned) {
+                    fp.readerMethods.add(method.name);
+                }
             }
         }
 
@@ -210,7 +237,7 @@ public class ProducerConsumerAnalyzer {
             int openBrace = -1;
             for (int i = closeParen + 1; i < len; i++) {
                 char c = clean.charAt(i);
-                if (c == ';') break; // Декларация без тела
+                if (c == ';') break;
                 if (c == '{') {
                     openBrace = i;
                     break;
@@ -238,25 +265,5 @@ public class ProducerConsumerAnalyzer {
             }
         }
         return -1;
-    }
-
-    private static void analyzeFieldUsageInMethod(String methodName, String body, FieldProfile fp) {
-        String quotedField = Pattern.quote(fp.name);
-
-        Pattern writePattern = Pattern.compile(
-                "\\b" + quotedField + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
-                Pattern.MULTILINE
-        );
-        Pattern prefixIncPattern = Pattern.compile("(?:\\+\\+|--)\\s*" + quotedField + "\\b");
-
-        boolean isWrite = writePattern.matcher(body).find() || prefixIncPattern.matcher(body).find();
-        Pattern readPattern = Pattern.compile("\\b" + quotedField + "\\b");
-        boolean isMentioned = readPattern.matcher(body).find();
-
-        if (isWrite) {
-            fp.writerMethods.add(methodName);
-        } else if (isMentioned) {
-            fp.readerMethods.add(methodName);
-        }
     }
 }
