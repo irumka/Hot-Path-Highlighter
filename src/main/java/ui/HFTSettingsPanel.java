@@ -22,6 +22,9 @@ public class HFTSettingsPanel {
 
     private final JPanel rootPanel;
 
+    // Единая кнопка-тумблер Вкл/Выкл
+    private final JButton btnToggleAll;
+
     // Графика карты памяти
     private final JBCheckBox chkShowMemoryMapBar;
     private final JBCheckBox chkHoverTooltips;
@@ -44,6 +47,12 @@ public class HFTSettingsPanel {
     private final JBCheckBox chkGlobalAtomics;
     private final JBCheckBox chkAutoEnableCpp;
 
+    // Кремниевые детекторы
+    private final JBCheckBox chkStoreForwarding;
+    private final JBCheckBox chkBranchPredictor;
+    private final JBCheckBox chkVirtualCalls;
+    private final JBCheckBox chkMisalignedAlloc;
+
     // Архитектура
     private final ComboBox<Integer> cmbCacheLineSize;
     private final ComboBox<PlatformDetector.TargetPlatform> cmbTargetPlatform;
@@ -52,7 +61,6 @@ public class HFTSettingsPanel {
     private Runnable changeListener = null;
 
     public HFTSettingsPanel() {
-        // Карта памяти
         chkShowMemoryMapBar = new JBCheckBox("Display 64B cache line memory grid (above struct)");
         chkHoverTooltips = new JBCheckBox("Interactive hover byte inspector tooltip");
 
@@ -60,14 +68,12 @@ public class HFTSettingsPanel {
         cmbMaxBarRows = new ComboBox<>(rowLimitOptions);
         cmbColorScheme = new ComboBox<>(HFTSettings.ColorScheme.values());
 
-        // Строчные бейджи
         chkShowFieldOffsets = new JBCheckBox("Field offsets & sizes [off 0, 8B]");
         chkShowPaddingBadges = new JBCheckBox("Padding gap indicators [+7B pad]");
         chkShowSplitBadges = new JBCheckBox("Cache line boundary split badges [split]");
         chkShowFalseSharingBadges = new JBCheckBox("MESI contention badges [ping-pong / invalidation]");
-        chkShowHotColdBadges = new JBCheckBox("Hot / Cold data access tags [cold]");
+        chkShowHotColdBadges = new JBCheckBox("Hot / Cold data access tags [cold] / [hot]");
 
-        // Модули
         chkPadding = new JBCheckBox("Padding waste analysis & visual markers");
         chkCacheLine = new JBCheckBox("Cache line boundaries calculation");
         chkFalseSharing = new JBCheckBox("False sharing & lock contention analysis");
@@ -76,34 +82,34 @@ public class HFTSettingsPanel {
         chkGlobalAtomics = new JBCheckBox("Global atomics audit (detect contiguous static variables)");
         chkAutoEnableCpp = new JBCheckBox("Automatically analyze C/C++ files on open");
 
+        chkStoreForwarding = new JBCheckBox("Store-to-Load Forwarding (STLF) & 4K Aliasing detector");
+        chkBranchPredictor = new JBCheckBox("Branch predictor hot path linter ([[unlikely]] hints)");
+        chkVirtualCalls = new JBCheckBox("Virtual dispatch / vtable call linter on hot path");
+        chkMisalignedAlloc = new JBCheckBox("Misaligned container allocator linter (alignas > 16 in std::vector)");
+
         Integer[] cacheLineOptions = new Integer[]{32, 64, 128, 256};
         cmbCacheLineSize = new ComboBox<>(cacheLineOptions);
         cmbTargetPlatform = new ComboBox<>(PlatformDetector.TargetPlatform.values());
 
-        // Пресеты
-        JPanel presetBar = new JPanel(new FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0));
-        JButton btnFullHft = new JButton("All Features ON");
+        // Единая кнопка переключения Вкл/Выкл
+        btnToggleAll = new JButton("Disable All");
+        btnToggleAll.setFocusable(false);
+        btnToggleAll.addActionListener(e -> toggleAllFeatures());
+
         JButton btnLowNoise = new JButton("Low Noise (Critical Only)");
-        JButton btnDisableAll = new JButton("Disable All");
-
-        btnFullHft.setFocusable(false);
         btnLowNoise.setFocusable(false);
-        btnDisableAll.setFocusable(false);
-
-        btnFullHft.addActionListener(e -> applyPreset(Preset.FULL));
         btnLowNoise.addActionListener(e -> applyPreset(Preset.LOW_NOISE));
-        btnDisableAll.addActionListener(e -> applyPreset(Preset.NONE));
 
-        presetBar.add(btnFullHft);
+        JPanel presetBar = new JPanel(new FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0));
+        presetBar.add(btnToggleAll);
         presetBar.add(btnLowNoise);
-        presetBar.add(btnDisableAll);
 
         JButton btnReanalyze = new JButton("Re-Analyze Active Editor");
         btnReanalyze.setFocusable(false);
         btnReanalyze.addActionListener(e -> triggerReanalysis());
 
         rootPanel = FormBuilder.createFormBuilder()
-                .addComponent(new JBLabel("<html><b>Quick Presets</b></html>"))
+                .addComponent(new JBLabel("<html><b>Quick Actions & Presets</b></html>"))
                 .addComponent(presetBar)
                 .addVerticalGap(JBUI.scale(6))
                 .addComponent(new JSeparator())
@@ -128,11 +134,15 @@ public class HFTSettingsPanel {
                 .addComponent(new JSeparator())
                 .addVerticalGap(JBUI.scale(6))
 
-                .addComponent(new JBLabel("<html><b>Analysis Engines & Linters</b></html>"))
+                .addComponent(new JBLabel("<html><b>Hardware Penalties & Silicon Linters</b></html>"))
                 .addComponent(chkPadding)
                 .addComponent(chkCacheLine)
                 .addComponent(chkFalseSharing)
                 .addComponent(chkHotCold)
+                .addComponent(chkStoreForwarding)
+                .addComponent(chkBranchPredictor)
+                .addComponent(chkVirtualCalls)
+                .addComponent(chkMisalignedAlloc)
                 .addComponent(chkZeroAlloc)
                 .addComponent(chkGlobalAtomics)
                 .addVerticalGap(JBUI.scale(6))
@@ -150,6 +160,59 @@ public class HFTSettingsPanel {
 
         rootPanel.setBorder(JBUI.Borders.empty(10));
         hookListeners();
+        updateToggleAllButtonText();
+    }
+
+    private boolean areAnyEnabled() {
+        return chkPadding.isSelected() ||
+                chkCacheLine.isSelected() ||
+                chkFalseSharing.isSelected() ||
+                chkHotCold.isSelected() ||
+                chkStoreForwarding.isSelected() ||
+                chkBranchPredictor.isSelected() ||
+                chkVirtualCalls.isSelected() ||
+                chkMisalignedAlloc.isSelected() ||
+                chkZeroAlloc.isSelected() ||
+                chkGlobalAtomics.isSelected() ||
+                chkShowMemoryMapBar.isSelected();
+    }
+
+    private void updateToggleAllButtonText() {
+        if (btnToggleAll != null) {
+            btnToggleAll.setText(areAnyEnabled() ? "Disable All" : "Enable All");
+        }
+    }
+
+    private void toggleAllFeatures() {
+        boolean enable = !areAnyEnabled();
+        isUpdating = true;
+        try {
+            chkShowMemoryMapBar.setSelected(enable);
+            chkHoverTooltips.setSelected(enable);
+            chkShowFieldOffsets.setSelected(enable);
+            chkShowPaddingBadges.setSelected(enable);
+            chkShowSplitBadges.setSelected(enable);
+            chkShowFalseSharingBadges.setSelected(enable);
+            chkShowHotColdBadges.setSelected(enable);
+
+            chkPadding.setSelected(enable);
+            chkCacheLine.setSelected(enable);
+            chkFalseSharing.setSelected(enable);
+            chkHotCold.setSelected(enable);
+            chkStoreForwarding.setSelected(enable);
+            chkBranchPredictor.setSelected(enable);
+            chkVirtualCalls.setSelected(enable);
+            chkMisalignedAlloc.setSelected(enable);
+            chkZeroAlloc.setSelected(enable);
+            chkGlobalAtomics.setSelected(enable);
+        } finally {
+            isUpdating = false;
+        }
+
+        updateToggleAllButtonText();
+        if (changeListener != null) {
+            changeListener.run();
+        }
     }
 
     private void triggerReanalysis() {
@@ -164,31 +227,13 @@ public class HFTSettingsPanel {
     }
 
     private enum Preset {
-        FULL,
-        LOW_NOISE,
-        NONE
+        LOW_NOISE
     }
 
     private void applyPreset(Preset preset) {
         isUpdating = true;
         try {
-            if (preset == Preset.FULL) {
-                chkShowMemoryMapBar.setSelected(true);
-                chkHoverTooltips.setSelected(true);
-                chkShowFieldOffsets.setSelected(true);
-                chkShowPaddingBadges.setSelected(true);
-                chkShowSplitBadges.setSelected(true);
-                chkShowFalseSharingBadges.setSelected(true);
-                chkShowHotColdBadges.setSelected(true);
-
-                chkPadding.setSelected(true);
-                chkCacheLine.setSelected(true);
-                chkFalseSharing.setSelected(true);
-                chkHotCold.setSelected(true);
-                chkZeroAlloc.setSelected(true);
-                chkGlobalAtomics.setSelected(true);
-            } else if (preset == Preset.LOW_NOISE) {
-                // Только критические сбои задержки (False sharing, Split, Heap violations)
+            if (preset == Preset.LOW_NOISE) {
                 chkShowMemoryMapBar.setSelected(false);
                 chkHoverTooltips.setSelected(false);
                 chkShowFieldOffsets.setSelected(false);
@@ -201,27 +246,18 @@ public class HFTSettingsPanel {
                 chkCacheLine.setSelected(true);
                 chkFalseSharing.setSelected(true);
                 chkHotCold.setSelected(false);
+                chkStoreForwarding.setSelected(true);
+                chkBranchPredictor.setSelected(false);
+                chkVirtualCalls.setSelected(true);
+                chkMisalignedAlloc.setSelected(true);
                 chkZeroAlloc.setSelected(true);
                 chkGlobalAtomics.setSelected(true);
-            } else {
-                chkShowMemoryMapBar.setSelected(false);
-                chkHoverTooltips.setSelected(false);
-                chkShowFieldOffsets.setSelected(false);
-                chkShowPaddingBadges.setSelected(false);
-                chkShowSplitBadges.setSelected(false);
-                chkShowFalseSharingBadges.setSelected(false);
-                chkShowHotColdBadges.setSelected(false);
-
-                chkPadding.setSelected(false);
-                chkCacheLine.setSelected(false);
-                chkFalseSharing.setSelected(false);
-                chkHotCold.setSelected(false);
-                chkZeroAlloc.setSelected(false);
-                chkGlobalAtomics.setSelected(false);
             }
         } finally {
             isUpdating = false;
         }
+
+        updateToggleAllButtonText();
         if (changeListener != null) {
             changeListener.run();
         }
@@ -229,8 +265,11 @@ public class HFTSettingsPanel {
 
     private void hookListeners() {
         ItemEventCallback cb = e -> {
-            if (!isUpdating && changeListener != null) {
-                changeListener.run();
+            if (!isUpdating) {
+                updateToggleAllButtonText();
+                if (changeListener != null) {
+                    changeListener.run();
+                }
             }
         };
 
@@ -247,6 +286,10 @@ public class HFTSettingsPanel {
         chkCacheLine.addItemListener(cb::onChange);
         chkFalseSharing.addItemListener(cb::onChange);
         chkHotCold.addItemListener(cb::onChange);
+        chkStoreForwarding.addItemListener(cb::onChange);
+        chkBranchPredictor.addItemListener(cb::onChange);
+        chkVirtualCalls.addItemListener(cb::onChange);
+        chkMisalignedAlloc.addItemListener(cb::onChange);
         chkZeroAlloc.addItemListener(cb::onChange);
         chkGlobalAtomics.addItemListener(cb::onChange);
         chkAutoEnableCpp.addItemListener(cb::onChange);
@@ -296,6 +339,10 @@ public class HFTSettingsPanel {
             chkCacheLine.setSelected(state.cacheLineBoundaries);
             chkFalseSharing.setSelected(state.falseSharingDetection);
             chkHotCold.setSelected(state.hotColdSeparation);
+            chkStoreForwarding.setSelected(state.storeForwardingDetection);
+            chkBranchPredictor.setSelected(state.branchPredictorLinter);
+            chkVirtualCalls.setSelected(state.virtualCallLinter);
+            chkMisalignedAlloc.setSelected(state.misalignedAllocatorDetection);
             chkZeroAlloc.setSelected(state.zeroAllocLinter);
             chkGlobalAtomics.setSelected(state.globalAtomicsAudit);
             chkAutoEnableCpp.setSelected(state.autoEnableCpp);
@@ -306,6 +353,7 @@ public class HFTSettingsPanel {
         } finally {
             isUpdating = false;
         }
+        updateToggleAllButtonText();
     }
 
     public void applyTo(@NotNull HFTSettings.State state) {
@@ -323,6 +371,10 @@ public class HFTSettingsPanel {
         state.cacheLineBoundaries = chkCacheLine.isSelected();
         state.falseSharingDetection = chkFalseSharing.isSelected();
         state.hotColdSeparation = chkHotCold.isSelected();
+        state.storeForwardingDetection = chkStoreForwarding.isSelected();
+        state.branchPredictorLinter = chkBranchPredictor.isSelected();
+        state.virtualCallLinter = chkVirtualCalls.isSelected();
+        state.misalignedAllocatorDetection = chkMisalignedAlloc.isSelected();
         state.zeroAllocLinter = chkZeroAlloc.isSelected();
         state.globalAtomicsAudit = chkGlobalAtomics.isSelected();
         state.autoEnableCpp = chkAutoEnableCpp.isSelected();
@@ -356,6 +408,10 @@ public class HFTSettingsPanel {
                 chkCacheLine.isSelected() != state.cacheLineBoundaries ||
                 chkFalseSharing.isSelected() != state.falseSharingDetection ||
                 chkHotCold.isSelected() != state.hotColdSeparation ||
+                chkStoreForwarding.isSelected() != state.storeForwardingDetection ||
+                chkBranchPredictor.isSelected() != state.branchPredictorLinter ||
+                chkVirtualCalls.isSelected() != state.virtualCallLinter ||
+                chkMisalignedAlloc.isSelected() != state.misalignedAllocatorDetection ||
                 chkZeroAlloc.isSelected() != state.zeroAllocLinter ||
                 chkGlobalAtomics.isSelected() != state.globalAtomicsAudit ||
                 chkAutoEnableCpp.isSelected() != state.autoEnableCpp ||
@@ -376,6 +432,6 @@ public class HFTSettingsPanel {
         if (idx == 0) return 4;
         if (idx == 1) return 8;
         if (idx == 2) return 16;
-        return 0; // unlimited
+        return 0;
     }
 }

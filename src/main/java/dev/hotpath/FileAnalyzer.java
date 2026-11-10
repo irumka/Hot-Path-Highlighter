@@ -8,8 +8,8 @@ import java.util.HashMap;
 import java.util.List;
 
 /**
- * One-shot analysis of a whole file: find marked regions, parse them,
- * compute layouts and false sharing conflicts. Safe to run off the EDT.
+ * Headless file analysis engine: finds marked regions, parses AST,
+ * computes layouts, and detects false sharing without editor dependencies.
  */
 public class FileAnalyzer {
 
@@ -50,8 +50,9 @@ public class FileAnalyzer {
 
     public static Result analyze(String text) {
         Result r = new Result();
-        ArrayList<HotRegionFinder.Region> regions = HotPathHighlighter.findAll(text);
-        int limit = Math.min(regions.size(), 200);
+        // Прямой вызов парсера регионов без зависимости от редактора HotPathHighlighter
+        ArrayList<HotRegionFinder.Region> regions = HotRegionFinder.findAllStructs(text);
+        int limit = Math.min(regions.size(), 300);
 
         ArrayList<CppStructParser.StructInfo> infos = new ArrayList<>();
         for (int i = 0; i < limit; i++) {
@@ -67,9 +68,7 @@ public class FileAnalyzer {
         for (int round = 0; round < 2; round++) {
             for (int i = 0; i < limit; i++) {
                 CppStructParser.StructInfo info = infos.get(i);
-                if (info == null) {
-                    continue;
-                }
+                if (info == null) continue;
                 LayoutCalculator.Layout l = LayoutCalculator.compute(info, r.locals);
                 if (l.complete && !info.name.isEmpty()) {
                     r.locals.put(info.name, new int[]{l.totalSize, maxAlignOf(l)});
@@ -82,9 +81,7 @@ public class FileAnalyzer {
 
         for (int i = 0; i < limit; i++) {
             CppStructParser.StructInfo info = infos.get(i);
-            if (info == null) {
-                continue;
-            }
+            if (info == null) continue;
             HotRegionFinder.Region reg = regions.get(i);
             String block = safeSubstring(text, reg.bStart(), reg.bEnd());
 
@@ -145,9 +142,7 @@ public class FileAnalyzer {
     static int maxAlignOf(LayoutCalculator.Layout l) {
         int mx = 1;
         for (CppStructParser.Field f : l.fields) {
-            if (f.align > mx) {
-                mx = f.align;
-            }
+            if (f.align > mx) mx = f.align;
         }
         return mx;
     }

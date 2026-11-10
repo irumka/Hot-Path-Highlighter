@@ -9,9 +9,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves C++ type sizes, alignments and atomic traits across different ABIs:
- * - Linux / macOS (LP64): long = 8B, long double = 16B, wchar_t = 4B
- * - Windows MSVC (LLP64): long = 4B, long double = 8B, wchar_t = 2B
+ * Resolves C++ type sizes, alignments and atomic traits across different ABIs.
+ * Supports recursive std::array<T, N>, std::optional<T>, C-arrays, and STL containers.
  */
 public class TypeResolver {
 
@@ -41,6 +40,8 @@ public class TypeResolver {
     private static final Pattern VOLATILE_PATTERN = Pattern.compile("\\bvolatile\\b");
     private static final Pattern WHITESPACE_PATTERN = Pattern.compile("\\s+");
     private static final Pattern ARRAY_PATTERN = Pattern.compile("^(.*?)\\[(\\d+)\\]\\s*$");
+    private static final Pattern STD_ARRAY_PATTERN = Pattern.compile("^(?:std::)?array<\\s*(.+)\\s*,\\s*(\\d+)\\s*>\\s*$");
+    private static final Pattern STD_OPTIONAL_PATTERN = Pattern.compile("^(?:std::)?optional<\\s*(.+)\\s*>\\s*$");
     private static final Pattern ATOMIC_PATTERN = Pattern.compile("^(?:std::)?atomic<([^>]+)>$");
 
     public static void clearCache() {
@@ -74,23 +75,28 @@ public class TypeResolver {
         return n > 0 && (n & (n - 1)) == 0;
     }
 
+    private static int roundUp(int pos, int align) {
+        if (align <= 1) return pos;
+        int rem = pos % align;
+        return rem == 0 ? pos : pos + (align - rem);
+    }
+
     private static TypeInfo resolveDirect(String type,
                                           PlatformDetector.TargetPlatform effPlatform,
                                           Map<String, int[]> customTypes) {
         boolean isWin = PlatformDetector.isWindows(effPlatform);
         boolean isMac = PlatformDetector.isMac(effPlatform);
-        int ptrSize = 8;
+        int ptrSize = 8; // 64-bit ABI default
 
         if (type.endsWith("*") || type.endsWith("&")) {
             return new TypeInfo(ptrSize, ptrSize);
         }
 
+        // 1. std::atomic<T>
         Matcher atomicMatcher = ATOMIC_PATTERN.matcher(type);
         if (atomicMatcher.find()) {
             String innerType = atomicMatcher.group(1).trim();
             TypeInfo inner = resolve(innerType, effPlatform, customTypes);
-
-            // Выравнивание std::atomic<T>: не менее выравнивания T, а для степеней двойки до 16B - размер
             int atomicAlign = inner.align;
             if (isPowerOfTwo(inner.size) && inner.size <= 16) {
                 atomicAlign = Math.max(atomicAlign, inner.size);
@@ -98,6 +104,30 @@ public class TypeResolver {
             return new TypeInfo(inner.size, atomicAlign, true);
         }
 
+        // 2. Рекурсивный std::array<T, N>
+        Matcher stdArrayMatcher = STD_ARRAY_PATTERN.matcher(type);
+        if (stdArrayMatcher.find()) {
+            String elemType = stdArrayMatcher.group(1).trim();
+            int count = 1;
+            try {
+                count = Integer.parseInt(stdArrayMatcher.group(2).trim());
+            } catch (NumberFormatException ignored) {}
+
+            TypeInfo elemInfo = resolve(elemType, effPlatform, customTypes);
+            return new TypeInfo(elemInfo.size * count, elemInfo.align);
+        }
+
+        // 3. std::optional<T> (значение T + флаг bool + паддинг до alignof(T))
+        Matcher optMatcher = STD_OPTIONAL_PATTERN.matcher(type);
+        if (optMatcher.find()) {
+            String innerType = optMatcher.group(1).trim();
+            TypeInfo inner = resolve(innerType, effPlatform, customTypes);
+            int payloadSize = inner.size + 1; // T + sizeof(bool)
+            int totalSize = roundUp(payloadSize, inner.align);
+            return new TypeInfo(totalSize, inner.align);
+        }
+
+        // 4. Обычные C-массивы T[N]
         Matcher arrayMatcher = ARRAY_PATTERN.matcher(type);
         if (arrayMatcher.find()) {
             String elemType = arrayMatcher.group(1).trim();

@@ -4,9 +4,8 @@
     <vendor email="support@hotpath.dev" url="https://hotpath.dev">HotPath Dev</vendor>
 
     <description><![CDATA[
-      High-frequency trading memory layout optimizer and static hardware latency analyzer.
-      Visualizes 64-byte L1 cache line boundaries, detects false sharing, ping-pong contention,
-      cache line splits, zero-alloc heap hazards, and provides instant Alt+Enter fixes.
+      High-frequency trading memory layout optimizer, cache contention analyzer,
+      STLF stall detector, SIMD Crash Guard and Compiler Explorer ASM bridge for C++.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
@@ -77,6 +76,16 @@
         </intentionAction>
         <intentionAction>
             <className>optimization.CompileTimeGuardIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+
+        <!-- Новые намерения (Phase 1 & 2) -->
+        <intentionAction>
+            <className>optimization.BranchLikelyIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.GodboltIntention</className>
             <category>C/C++ HFT Optimizations</category>
         </intentionAction>
     </extensions>

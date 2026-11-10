@@ -17,29 +17,39 @@ public class HFTToolWindowFactory implements ToolWindowFactory, DumbAware {
 
     @Override
     public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
-        HFTSettingsPanel panel = new HFTSettingsPanel();
-        panel.loadFrom(HFTSettings.getInstance().getState());
+        ContentFactory contentFactory = ContentFactory.getInstance();
 
-        // При любом клике на чекбокс в ToolWindow сразу сохраняем состояние
-        panel.setOnChangeListener(() -> {
+        // 1. Вкладка HFT Latency Dashboard
+        HFTDashboardPanel dashboardPanel = new HFTDashboardPanel(project);
+        Content dashboardContent = contentFactory.createContent(dashboardPanel, "Latency Dashboard", false);
+        toolWindow.getContentManager().addContent(dashboardContent);
+
+        // 2. Вкладка настроек и конфигурации
+        HFTSettingsPanel settingsPanel = new HFTSettingsPanel();
+        settingsPanel.loadFrom(HFTSettings.getInstance().getState());
+
+        settingsPanel.setOnChangeListener(() -> {
             HFTSettings settings = HFTSettings.getInstance();
             HFTSettings.State stateCopy = new HFTSettings.State(settings.getState());
-            panel.applyTo(stateCopy);
+            settingsPanel.applyTo(stateCopy);
             settings.updateState(stateCopy);
+            dashboardPanel.refreshDashboard();
         });
 
-        // Слушаем изменение настроек из глобальной шины приложения
         ApplicationManager.getApplication().getMessageBus()
                 .connect(toolWindow.getDisposable())
-                .subscribe(HFTSettingsListener.TOPIC, panel::loadFrom);
+                .subscribe(HFTSettingsListener.TOPIC, newState -> {
+                    settingsPanel.loadFrom(newState);
+                    dashboardPanel.refreshDashboard();
+                });
 
         JPanel wrapper = new JPanel(new BorderLayout());
-        wrapper.add(panel.getRootComponent(), BorderLayout.NORTH);
+        wrapper.add(settingsPanel.getRootComponent(), BorderLayout.NORTH);
 
         JBScrollPane scrollPane = new JBScrollPane(wrapper);
         scrollPane.setBorder(BorderFactory.createEmptyBorder());
 
-        Content content = ContentFactory.getInstance().createContent(scrollPane, "Quick Configuration", false);
-        toolWindow.getContentManager().addContent(content);
+        Content settingsContent = contentFactory.createContent(scrollPane, "Settings & Presets", false);
+        toolWindow.getContentManager().addContent(settingsContent);
     }
 }

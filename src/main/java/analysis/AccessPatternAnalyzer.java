@@ -8,7 +8,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Classifies struct fields into HOT (critical execution path) and COLD (diagnostic, logging, rare errors).
+ * Classifies struct fields into HOT (critical path) and COLD (diagnostic, logging, rare errors).
+ * Uses multi-factor semantic analysis: loop bodies, error handlers, and naming heuristics.
  */
 public class AccessPatternAnalyzer {
 
@@ -48,61 +49,80 @@ public class AccessPatternAnalyzer {
     @NotNull
     public static Map<String, FieldAnalysis> analyze(@NotNull CppStructParser.StructInfo info, @NotNull String structBlockText) {
         Map<String, FieldAnalysis> result = new HashMap<>();
+        String cleanBlock = CppStructParser.clearCommentsAndStrings(structBlockText);
 
         for (CppStructParser.Field field : info.fields) {
             String name = field.name;
-            if (name == null || name.isEmpty()) continue;
+            if (name == null || name.isEmpty() || name.startsWith("_unnamed_bitfield")) continue;
 
+            // 1. Проверка по эвристикам имен
             if (COLD_NAME_PATTERN.matcher(name).matches()) {
-                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Matches cold naming pattern (diagnostic/error/log)"));
+                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Diagnostic/logging naming pattern"));
                 continue;
             }
 
             if (HOT_NAME_PATTERN.matcher(name).matches() || field.atomic) {
-                result.put(name, new FieldAnalysis(name, Temperature.HOT, "Matches hot naming pattern or atomic"));
+                result.put(name, new FieldAnalysis(name, Temperature.HOT, "Critical path naming or atomic"));
                 continue;
             }
 
-            boolean usedInColdMethodOnly = isUsedOnlyInColdMethods(name, structBlockText);
-            if (usedInColdMethodOnly) {
-                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Only accessed in diagnostic/logging methods"));
+            // 2. Семантический контекстный анализ (циклы vs обработчики ошибок)
+            boolean usedInLoop = isAccessedInsideLoop(name, cleanBlock);
+            if (usedInLoop) {
+                result.put(name, new FieldAnalysis(name, Temperature.HOT, "Accessed inside hot processing loop"));
                 continue;
             }
 
+            boolean usedInColdOnly = isUsedOnlyInColdContext(name, cleanBlock);
+            if (usedInColdOnly) {
+                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Only accessed in diagnostic/error methods"));
+                continue;
+            }
+
+            // 3. Тяжелые контейнеры по умолчанию считаются COLD в горячей структуре
             String decl = field.decl != null ? field.decl.toLowerCase() : "";
-            if (decl.contains("string") || decl.contains("char[") || decl.contains("vector")) {
-                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Heavy container/buffer inside critical struct"));
+            if (decl.contains("string") || decl.contains("vector")) {
+                result.put(name, new FieldAnalysis(name, Temperature.COLD, "Heavy heap container in struct"));
                 continue;
             }
 
-            result.put(name, new FieldAnalysis(name, Temperature.NEUTRAL, "General scalar data"));
+            result.put(name, new FieldAnalysis(name, Temperature.NEUTRAL, "General data"));
         }
 
         return result;
     }
 
-    private static boolean isUsedOnlyInColdMethods(String fieldName, String structBlock) {
-        Pattern methodDef = Pattern.compile(
-                "([a-zA-Z_0-9]+)\\s*\\([^)]*\\)\\s*(?:const)?\\s*\\{([^}]+)\\}",
-                Pattern.MULTILINE
-        );
-        Matcher matcher = methodDef.matcher(structBlock);
+    private static boolean isAccessedInsideLoop(String fieldName, String code) {
+        Pattern loopPattern = Pattern.compile("\\b(for|while|do)\\s*\\([^)]*\\)\\s*\\{([^}]+)\\}");
+        Matcher m = loopPattern.matcher(code);
+        String pattern = "\\b" + Pattern.quote(fieldName) + "\\b";
+        while (m.find()) {
+            if (Pattern.compile(pattern).matcher(m.group(2)).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isUsedOnlyInColdContext(String fieldName, String code) {
+        Pattern methodDef = Pattern.compile("([a-zA-Z_0-9]+)\\s*\\([^)]*\\)[^{]*\\{([^}]+)\\}");
+        Matcher matcher = methodDef.matcher(code);
 
         boolean foundUsage = false;
         boolean foundInHotMethod = false;
+        String fieldRegex = "\\b" + Pattern.quote(fieldName) + "\\b";
 
         while (matcher.find()) {
             String methodName = matcher.group(1);
             String body = matcher.group(2);
 
-            if (body.contains(fieldName)) {
+            if (Pattern.compile(fieldRegex).matcher(body).find()) {
                 foundUsage = true;
                 if (!COLD_METHOD_PATTERN.matcher(methodName).matches()) {
                     foundInHotMethod = true;
                 }
             }
         }
-
         return foundUsage && !foundInHotMethod;
     }
 }

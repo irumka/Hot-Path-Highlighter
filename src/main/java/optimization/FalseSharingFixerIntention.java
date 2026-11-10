@@ -23,12 +23,13 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Alt+Enter action: Targets the exact conflicting field causing false sharing
- * and isolates it via alignas(64) with clean indentation.
+ * Alt+Enter action: Targets conflicting fields causing false sharing
+ * and isolates both of them via alignas(64) to strictly guarantee distinct cache lines.
  */
 public class FalseSharingFixerIntention extends PsiElementBaseIntentionAction implements DumbAware, IntentionAction {
 
-    private String targetFieldName = null;
+    private String firstFieldName = null;
+    private String secondFieldName = null;
 
     @NotNull
     @Override
@@ -51,20 +52,14 @@ public class FalseSharingFixerIntention extends PsiElementBaseIntentionAction im
         ArrayList<HotRegionFinder.Region> regions = HotRegionFinder.findAllStructs(text);
 
         for (HotRegionFinder.Region r : regions) {
-            if (offset < r.mStart() || offset > r.bEnd()) {
-                continue;
-            }
+            if (offset < r.mStart() || offset > r.bEnd()) continue;
 
             String block = text.substring(r.bStart(), Math.min(r.bEnd(), text.length()));
             CppStructParser.StructInfo info = CppStructParser.parse(block);
-            if (info == null || info.fields.size() < 2) {
-                return false;
-            }
+            if (info == null || info.fields.size() < 2) return false;
 
             LayoutCalculator.Layout layout = LayoutCalculator.compute(info, new HashMap<>());
-            if (!layout.complete) {
-                return false;
-            }
+            if (!layout.complete) return false;
 
             int cacheLineSize = HFTSettings.getInstance().getState().cacheLineSize;
             ProducerConsumerAnalyzer.StructProfile profile = ProducerConsumerAnalyzer.analyze(info, block);
@@ -84,48 +79,19 @@ public class FalseSharingFixerIntention extends PsiElementBaseIntentionAction im
             }
 
             FalseSharingDetector.Result result = FalseSharingDetector.detect(cacheFields, cacheLineSize, profile);
-            if (result.conflicts.isEmpty()) {
-                return false;
-            }
+            if (result.conflicts.isEmpty()) return false;
 
-            CppStructParser.Field targetField = findTargetField(info, result.conflicts, r.bStart(), offset);
-            if (targetField != null) {
-                this.targetFieldName = targetField.name;
-                return true;
-            }
+            FalseSharingDetector.Conflict firstConflict = result.conflicts.get(0);
+            this.firstFieldName = firstConflict.first.name;
+            this.secondFieldName = firstConflict.second.name;
+            return true;
         }
         return false;
     }
 
-    private CppStructParser.Field findTargetField(CppStructParser.StructInfo info,
-                                                  List<FalseSharingDetector.Conflict> conflicts,
-                                                  int regionStart,
-                                                  int caretOffset) {
-        for (FalseSharingDetector.Conflict conflict : conflicts) {
-            for (CppStructParser.Field f : info.fields) {
-                int fStart = regionStart + f.start;
-                int fEnd = regionStart + f.end;
-                if (caretOffset >= fStart && caretOffset <= fEnd) {
-                    if (f.name.equals(conflict.first.name) || f.name.equals(conflict.second.name)) {
-                        return f;
-                    }
-                }
-            }
-        }
-
-        FalseSharingDetector.Conflict firstConflict = conflicts.get(0);
-        for (CppStructParser.Field f : info.fields) {
-            if (f.name.equals(firstConflict.second.name)) {
-                return f;
-            }
-        }
-
-        return null;
-    }
-
     @Override
     public void invoke(@NotNull Project project, Editor editor, @NotNull PsiElement element) {
-        if (editor == null || targetFieldName == null) return;
+        if (editor == null || firstFieldName == null || secondFieldName == null) return;
 
         Document document = editor.getDocument();
         String docText = document.getText();
@@ -133,48 +99,51 @@ public class FalseSharingFixerIntention extends PsiElementBaseIntentionAction im
         ArrayList<HotRegionFinder.Region> regions = HotRegionFinder.findAllStructs(docText);
 
         for (HotRegionFinder.Region r : regions) {
-            if (offset < r.mStart() || offset > r.bEnd()) {
-                continue;
+            if (offset < r.mStart() || offset > r.bEnd()) continue;
+
+            int cacheLineSize = HFTSettings.getInstance().getState().cacheLineSize;
+
+            WriteCommandAction.runWriteCommandAction(project, () -> {
+                // Выравниваем оба конфликтующих поля для 100% гарантии разнесения по кэш-линиям
+                alignFieldInDoc(document, r, secondFieldName, cacheLineSize);
+                alignFieldInDoc(document, r, firstFieldName, cacheLineSize);
+            });
+            return;
+        }
+    }
+
+    private void alignFieldInDoc(Document document, HotRegionFinder.Region r, String fieldName, int cacheLineSize) {
+        String docText = document.getText();
+        int searchStart = r.bStart();
+        int searchEnd = Math.min(r.bEnd(), document.getTextLength());
+        String structBlock = docText.substring(searchStart, searchEnd);
+
+        Pattern fieldLinePattern = Pattern.compile(
+                "^[ \\t]*([^\\n;]*?\\b" + Pattern.quote(fieldName) + "\\b[^;\\n]*;)",
+                Pattern.MULTILINE
+        );
+        Matcher matcher = fieldLinePattern.matcher(structBlock);
+
+        if (matcher.find()) {
+            int lineStartInDoc = searchStart + matcher.start();
+            int lineIndex = document.getLineNumber(lineStartInDoc);
+            int lineStart = document.getLineStartOffset(lineIndex);
+            int lineEnd = document.getLineEndOffset(lineIndex);
+            String lineContent = document.getText().substring(lineStart, lineEnd);
+
+            int firstNonWs = 0;
+            while (firstNonWs < lineContent.length() && Character.isWhitespace(lineContent.charAt(firstNonWs))) {
+                firstNonWs++;
             }
 
-            int searchStart = r.bStart();
-            int searchEnd = Math.min(r.bEnd(), document.getTextLength());
-            String structBlock = docText.substring(searchStart, searchEnd);
-
-            Pattern fieldLinePattern = Pattern.compile(
-                    "^[ \\t]*([^\\n;]*?\\b" + Pattern.quote(targetFieldName) + "\\b[^;\\n]*;)",
-                    Pattern.MULTILINE
-            );
-            Matcher matcher = fieldLinePattern.matcher(structBlock);
-
-            if (matcher.find()) {
-                int lineStartInDoc = searchStart + matcher.start();
-                int lineIndex = document.getLineNumber(lineStartInDoc);
-                int lineStart = document.getLineStartOffset(lineIndex);
-                int lineEnd = document.getLineEndOffset(lineIndex);
-                String lineContent = document.getText().substring(lineStart, lineEnd);
-
-                int firstNonWhitespace = 0;
-                while (firstNonWhitespace < lineContent.length() &&
-                        Character.isWhitespace(lineContent.charAt(firstNonWhitespace))) {
-                    firstNonWhitespace++;
-                }
-
-                int insertPos = lineStart + firstNonWhitespace;
-                int cacheLineSize = HFTSettings.getInstance().getState().cacheLineSize;
-
-                WriteCommandAction.runWriteCommandAction(project, () -> {
-                    Pattern alignPattern = Pattern.compile("alignas\\s*\\([^)]*\\)\\s*");
-                    Matcher am = alignPattern.matcher(lineContent);
-                    if (am.find()) {
-                        int rStart = lineStart + am.start();
-                        int rEnd = lineStart + am.end();
-                        document.replaceString(rStart, rEnd, "alignas(" + cacheLineSize + ") ");
-                    } else {
-                        document.insertString(insertPos, "alignas(" + cacheLineSize + ") ");
-                    }
-                });
-                return;
+            Pattern alignPattern = Pattern.compile("alignas\\s*\\([^)]*\\)\\s*");
+            Matcher am = alignPattern.matcher(lineContent);
+            if (am.find()) {
+                int rStart = lineStart + am.start();
+                int rEnd = lineStart + am.end();
+                document.replaceString(rStart, rEnd, "alignas(" + cacheLineSize + ") ");
+            } else {
+                document.insertString(lineStart + firstNonWs, "alignas(" + cacheLineSize + ") ");
             }
         }
     }

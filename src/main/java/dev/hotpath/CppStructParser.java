@@ -1,11 +1,11 @@
 package dev.hotpath;
 
 import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Lightweight text parser for C++ structs and classes.
- * Preserves raw declarations, inline and preceding comments for refactoring.
- * Correctly accounts for template brackets <...> and parentheses when finding statement ends.
+ * Lightweight C++ struct/class parser supporting inheritance, bitfields,
+ * explicit alignment, thread tags and comment extraction.
  */
 public class CppStructParser {
 
@@ -26,12 +26,14 @@ public class CppStructParser {
         public int start;
         public int end;
         public int arrayCount = 1;
+        public boolean isBitfield = false;
+        public int bitOffsetInUnit = 0;
 
         public String leadingComment = "";
         public String trailingComment = "";
 
         public boolean known() {
-            return align > 0 && size > 0;
+            return (align > 0 && size > 0) || (isBitfield && bits >= 0);
         }
 
         public String toFullCode(String indent) {
@@ -51,6 +53,8 @@ public class CppStructParser {
         public String name = "";
         public boolean union;
         public boolean hasVptr;
+        public int explicitStructAlign = 0;
+        public List<String> baseClasses = new ArrayList<>();
         public ArrayList<Field> fields = new ArrayList<>();
         public ArrayList<String[]> typedefs = new ArrayList<>();
         public ArrayList<String> notes = new ArrayList<>();
@@ -58,18 +62,20 @@ public class CppStructParser {
 
     public static StructInfo parse(String regionText) {
         if (regionText == null) return null;
-        String cleared = clearComments(regionText);
+        String cleared = clearCommentsAndStrings(regionText);
         int open = cleared.indexOf('{');
-        if (open < 0) {
-            return null;
-        }
+        if (open < 0) return null;
+
         String header = cleared.substring(0, open).trim();
         if (!header.contains("struct") && !header.contains("class") && !header.contains("union")) {
             return null;
         }
+
         StructInfo info = new StructInfo();
         info.union = headerWord(header, "union");
         info.name = extractName(header);
+        info.baseClasses = extractBaseClasses(header);
+        info.explicitStructAlign = extractAlignas(header);
 
         if (cleared.contains("packed") || cleared.contains("pack(1)") || cleared.contains("pack(push, 1)")
                 || cleared.contains("pack(push,1)")) {
@@ -78,9 +84,8 @@ public class CppStructParser {
 
         int bodyStart = open + 1;
         int bodyEnd = matchingClose(cleared, open);
-        if (bodyEnd < 0) {
-            bodyEnd = cleared.length();
-        }
+        if (bodyEnd < 0) bodyEnd = cleared.length();
+
         int depth = 0;
         int angleDepth = 0;
         int stmtStart = bodyStart;
@@ -114,7 +119,6 @@ public class CppStructParser {
             if (depth < 0) depth = 0;
             stmt.append(c);
 
-            // Точка с запятой является концом декларации только вне скобок и шаблонов
             if (depth == 0 && angleDepth == 0 && c == ';') {
                 String rawStmt = regionText.substring(stmtStart, Math.min(i + 1, regionText.length()));
                 Field f = addStatement(info, stmt.toString(), rawStmt, stmtStart, i, regionText, prevFieldEnd);
@@ -131,12 +135,9 @@ public class CppStructParser {
 
     static Field addStatement(StructInfo info, String text, String raw, int start, int endPos, String fullRegion, int prevFieldEnd) {
         String s = text.trim();
-        if (s.endsWith(";")) {
-            s = s.substring(0, s.length() - 1).trim();
-        }
-        if (s.isEmpty() || (s.endsWith(":") && !s.contains("("))) {
-            return null;
-        }
+        if (s.endsWith(";")) s = s.substring(0, s.length() - 1).trim();
+        if (s.isEmpty() || (s.endsWith(":") && !s.contains("("))) return null;
+
         if (s.startsWith("static ") || startsWithWord(s, "static") || s.startsWith("friend ") || s.startsWith("template ")) {
             return null;
         }
@@ -148,6 +149,7 @@ public class CppStructParser {
             recordUsing(info, s.substring("using ".length()));
             return null;
         }
+
         int firstParen = s.indexOf('(');
         if (firstParen >= 0) {
             boolean funcPointer = firstParen + 1 < s.length() && s.charAt(firstParen + 1) == '*';
@@ -156,21 +158,7 @@ public class CppStructParser {
                 return null;
             }
         }
-        if (s.startsWith("enum ")) {
-            if (!s.contains("{") && countTopLevelWords(s) <= 1 && !s.contains("class ")) {
-                Field f = parseField(s);
-                if (f != null) {
-                    finishField(info, f, raw, start, endPos, fullRegion, prevFieldEnd);
-                    return f;
-                }
-            }
-            return null;
-        }
-        if ((containsWord(s, "struct") || containsWord(s, "class")) && s.contains("{")) {
-            String after = afterBrace(s);
-            if (after.isEmpty()) return null;
-            s = stripBraceBlock(s);
-        }
+
         Field f = parseField(s);
         if (f != null) {
             finishField(info, f, raw, start, endPos, fullRegion, prevFieldEnd);
@@ -212,19 +200,7 @@ public class CppStructParser {
         Field f = new Field();
         String work = s.trim();
 
-        int colon = topLevelIndexOf(work, ':');
-        if (colon > 0) {
-            String tail = work.substring(colon + 1).trim();
-            if (tail.matches("\\d+")) {
-                f.bits = Integer.parseInt(tail);
-                work = work.substring(0, colon).trim();
-            }
-        }
-        int eq = topLevelIndexOf(work, '=');
-        if (eq >= 0) work = work.substring(0, eq).trim();
-        int br = work.indexOf('{');
-        if (br >= 0 && colon < 0) work = work.substring(0, br).trim();
-
+        // 1. Извлекаем alignas(...)
         int al = work.indexOf("alignas(");
         if (al >= 0) {
             int close = work.indexOf(')', al);
@@ -238,6 +214,23 @@ public class CppStructParser {
             }
         }
 
+        // 2. Проверяем битовые поля (: N)
+        int colon = topLevelIndexOf(work, ':');
+        if (colon > 0) {
+            String tail = work.substring(colon + 1).trim();
+            if (tail.matches("\\d+")) {
+                f.isBitfield = true;
+                f.bits = Integer.parseInt(tail);
+                work = work.substring(0, colon).trim();
+            }
+        }
+
+        int eq = topLevelIndexOf(work, '=');
+        if (eq >= 0) work = work.substring(0, eq).trim();
+        int br = work.indexOf('{');
+        if (br >= 0 && colon < 0) work = work.substring(0, br).trim();
+
+        // 3. Извлекаем размерность массивов
         int total = 1;
         int bracket = work.indexOf('[');
         while (bracket >= 0) {
@@ -255,12 +248,16 @@ public class CppStructParser {
         f.arrayCount = total > 0 ? total : 1;
         f.decl = s;
         f.atomic = work.contains("atomic<") || work.contains("atomic_");
-        int comma = topLevelIndexOf(work, ',');
-        if (comma > 0) work = work.substring(0, comma).trim();
 
         f.name = lastIdentifier(work);
         f.type = typePart(work);
-        if (f.name.isEmpty() || f.type.isEmpty()) {
+
+        // Для анонимных битовых полей типа "uint32_t : 24;" имя может быть пустым
+        if (f.isBitfield && f.name.isEmpty()) {
+            f.name = "_unnamed_bitfield_" + System.identityHashCode(f);
+        }
+
+        if (f.type.isEmpty()) {
             return null;
         }
 
@@ -271,8 +268,10 @@ public class CppStructParser {
             f.atomic = true;
         }
 
-        if (f.bits >= 0) {
-            if (f.align > 0) f.size = Math.min(f.align, Math.max(1, (f.bits + 7) / 8));
+        if (f.isBitfield) {
+            // Начальный размер ячейки битового поля берется от базового типа
+            if (f.align == 0) f.align = 4;
+            if (f.size == 0) f.size = 4;
         } else if (total == -1) {
             f.size = 0;
             f.align = 0;
@@ -280,6 +279,35 @@ public class CppStructParser {
             f.size = f.size * total;
         }
         return f;
+    }
+
+    static List<String> extractBaseClasses(String header) {
+        List<String> bases = new ArrayList<>();
+        int colon = header.indexOf(':');
+        if (colon < 0) return bases;
+
+        String tail = header.substring(colon + 1).trim();
+        String[] parts = tail.split(",");
+        for (String p : parts) {
+            String clean = p.replaceAll("\\b(public|protected|private|virtual)\\b", "").trim();
+            if (!clean.isEmpty()) {
+                bases.add(clean);
+            }
+        }
+        return bases;
+    }
+
+    static int extractAlignas(String header) {
+        int idx = header.indexOf("alignas(");
+        if (idx >= 0) {
+            int close = header.indexOf(')', idx);
+            if (close > idx) {
+                try {
+                    return Integer.parseInt(header.substring(idx + 8, close).trim());
+                } catch (Exception ignored) {}
+            }
+        }
+        return 0;
     }
 
     static String findThreadTag(String raw) {
@@ -304,13 +332,12 @@ public class CppStructParser {
             if (c == '*' && i + 1 < tag.length() && tag.charAt(i + 1) == '/') break;
             sb.append(c);
         }
-        String t = sb.toString().trim();
-        return t.isEmpty() ? null : t;
+        return sb.toString().trim();
     }
 
-    public static String clearComments(String text) {
+    public static String clearCommentsAndStrings(String text) {
         char[] out = text.toCharArray();
-        int state = 0;
+        int state = 0; // 0=code, 1=lineComment, 2=blockComment, 3=string, 4=char
         for (int i = 0; i < out.length; i++) {
             char c = out[i];
             char n = i + 1 < out.length ? out[i + 1] : 0;
@@ -327,8 +354,10 @@ public class CppStructParser {
                     i++;
                 } else if (c == '"') {
                     state = 3;
+                    out[i] = ' ';
                 } else if (c == '\'') {
                     state = 4;
+                    out[i] = ' ';
                 }
             } else if (state == 1) {
                 if (c == '\n') state = 0; else out[i] = ' ';
@@ -340,12 +369,28 @@ public class CppStructParser {
                     i++;
                 }
             } else if (state == 3) {
-                if (c == '\\') i++; else if (c == '"') state = 0;
+                out[i] = ' ';
+                if (c == '\\') {
+                    if (i + 1 < out.length) out[i + 1] = ' ';
+                    i++;
+                } else if (c == '"') {
+                    state = 0;
+                }
             } else if (state == 4) {
-                if (c == '\\') i++; else if (c == '\'') state = 0;
+                out[i] = ' ';
+                if (c == '\\') {
+                    if (i + 1 < out.length) out[i + 1] = ' ';
+                    i++;
+                } else if (c == '\'') {
+                    state = 0;
+                }
             }
         }
         return new String(out);
+    }
+
+    public static String clearComments(String text) {
+        return clearCommentsAndStrings(text);
     }
 
     static void recordTypedef(StructInfo info, String rest) {
@@ -385,24 +430,6 @@ public class CppStructParser {
     }
 
     static String lastIdentifier(String s) {
-        return lastIdentifierSimple(s);
-    }
-
-    static String typePart(String s) {
-        String name = lastIdentifierSimple(s);
-        if (name.isEmpty()) return s.trim();
-        int idx = s.lastIndexOf(name);
-        if (idx < 0) return s.trim();
-        String t = s.substring(0, idx).trim();
-        String tail = s.substring(idx + name.length()).trim();
-        return (t + " " + tail).replaceAll("\\s+", " ").trim();
-    }
-
-    static boolean isIdChar(char c) {
-        return Character.isJavaIdentifierPart(c);
-    }
-
-    static String lastIdentifierSimple(String s) {
         int angle = 0;
         StringBuilder flat = new StringBuilder();
         for (int i = 0; i < s.length(); i++) {
@@ -413,10 +440,20 @@ public class CppStructParser {
         }
         String t = flat.toString();
         int end = t.length();
-        while (end > 0 && !isIdChar(t.charAt(end - 1))) end--;
+        while (end > 0 && !Character.isJavaIdentifierPart(t.charAt(end - 1))) end--;
         int begin = end;
-        while (begin > 0 && isIdChar(t.charAt(begin - 1))) begin--;
+        while (begin > 0 && Character.isJavaIdentifierPart(t.charAt(begin - 1))) begin--;
         return t.substring(begin, end);
+    }
+
+    static String typePart(String s) {
+        String name = lastIdentifier(s);
+        if (name.isEmpty()) return s.trim();
+        int idx = s.lastIndexOf(name);
+        if (idx < 0) return s.trim();
+        String t = s.substring(0, idx).trim();
+        String tail = s.substring(idx + name.length()).trim();
+        return (t + " " + tail).replaceAll("\\s+", " ").trim();
     }
 
     static int topLevelIndexOf(String s, char c) {
@@ -433,33 +470,6 @@ public class CppStructParser {
         return -1;
     }
 
-    static String afterBrace(String s) {
-        int open = s.indexOf('{');
-        if (open < 0) return "";
-        int depth = 0;
-        for (int i = open; i < s.length(); i++) {
-            if (s.charAt(i) == '{') depth++;
-            else if (s.charAt(i) == '}') {
-                depth--;
-                if (depth == 0) return s.substring(i + 1).replace(",", "").trim();
-            }
-        }
-        return "";
-    }
-
-    static String stripBraceBlock(String s) {
-        int open = s.indexOf('{');
-        int depth = 0;
-        for (int i = open; i < s.length(); i++) {
-            if (s.charAt(i) == '{') depth++;
-            else if (s.charAt(i) == '}') {
-                depth--;
-                if (depth == 0) return (s.substring(0, open) + " " + s.substring(i + 1)).trim();
-            }
-        }
-        return s.substring(0, open).trim();
-    }
-
     static boolean containsWord(String s, String word) {
         return (" " + s + " ").contains(" " + word + " ");
     }
@@ -470,10 +480,6 @@ public class CppStructParser {
 
     static boolean startsWithWord(String s, String word) {
         return s.equals(word) || s.startsWith(word + " ");
-    }
-
-    static int countTopLevelWords(String s) {
-        return s.replaceAll("<[^>]*>", " X ").trim().split("\\s+").length;
     }
 
     static String extractName(String header) {
@@ -487,9 +493,7 @@ public class CppStructParser {
             if (parts[i].equals("struct") || parts[i].equals("class") || parts[i].equals("union")) {
                 for (int j = i + 1; j < parts.length; j++) {
                     String cand = parts[j];
-                    if (cand.equals("final") || cand.equals("alignas")) {
-                        continue;
-                    }
+                    if (cand.equals("final") || cand.equals("alignas")) continue;
                     if (cand.matches("[A-Za-z_][A-Za-z0-9_:]*")) {
                         int scope = cand.lastIndexOf("::");
                         return scope >= 0 ? cand.substring(scope + 2) : cand;

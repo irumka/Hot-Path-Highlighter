@@ -1,7 +1,6 @@
 package dev.hotpath;
 
-import analysis.AccessPatternAnalyzer;
-import analysis.ZeroAllocLinter;
+import analysis.*;
 import com.intellij.codeInsight.hint.HintManager;
 import com.intellij.codeInsight.intention.IntentionAction;
 import com.intellij.openapi.application.ApplicationManager;
@@ -28,8 +27,7 @@ import java.util.List;
 
 /**
  * Main plugin engine: Memory map rendering, Interactive Hover Tooltip Inspector,
- * Zero-Alloc linting, Cache line splits, and Global Atomics Audit.
- * Incorporates an EDT debounce alarm to prevent UI freezes.
+ * STLF / 4K Aliasing, Misaligned Allocators, Zero-Alloc, and SIMD Crash Guard.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
 
@@ -75,9 +73,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
 
     private static void handleMouseHover(Editor ed, EditorMouseEvent event) {
         HFTSettings.State state = HFTSettings.getInstance().getState();
-        if (!state.hoverTooltips || !state.showMemoryMapBar) {
-            return;
-        }
+        if (!state.hoverTooltips || !state.showMemoryMapBar) return;
 
         Point p = event.getMouseEvent().getPoint();
         InlayModel model = ed.getInlayModel();
@@ -109,9 +105,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
         ApplicationManager.getApplication().invokeLater(() -> {
             Editor[] editors = EditorFactory.getInstance().getAllEditors();
             for (Editor editor : editors) {
-                if (!editor.isDisposed()) {
-                    refresh(editor);
-                }
+                if (!editor.isDisposed()) refresh(editor);
             }
         });
     }
@@ -120,9 +114,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> hints = model.getAfterLineEndElementsInRange(0, length);
         for (Inlay<?> inlay : hints) {
-            if (inlay.getRenderer() instanceof Hint) {
-                Disposer.dispose(inlay);
-            }
+            if (inlay.getRenderer() instanceof Hint) Disposer.dispose(inlay);
         }
     }
 
@@ -130,9 +122,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
         InlayModel model = ed.getInlayModel();
         List<Inlay<?>> bars = model.getBlockElementsInRange(0, length);
         for (Inlay<?> inlay : bars) {
-            if (inlay.getRenderer() instanceof Bar) {
-                Disposer.dispose(inlay);
-            }
+            if (inlay.getRenderer() instanceof Bar) Disposer.dispose(inlay);
         }
     }
 
@@ -153,19 +143,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
         removeOldBars(ed, text.length());
 
         HFTSettings.State state = HFTSettings.getInstance().getState();
-
-        if (state.autoEnableCpp && !isCppFile(ed)) {
-            return;
-        }
-
-        boolean anyEnabled = state.showMemoryMapBar || state.paddingVisualization || state.cacheLineBoundaries
-                || state.falseSharingDetection || state.hotColdSeparation
-                || state.zeroAllocLinter || state.globalAtomicsAudit
-                || state.showFieldOffsets || state.showPaddingBadges || state.showSplitBadges
-                || state.showFalseSharingBadges || state.showHotColdBadges;
-        if (!anyEnabled) {
-            return;
-        }
+        if (state.autoEnableCpp && !isCppFile(ed)) return;
 
         FileAnalyzer.Result result;
         try {
@@ -175,10 +153,18 @@ public class HotPathHighlighter implements EditorFactoryListener {
         }
         if (result == null || result.structs == null) return;
 
+        // Список всех структур файла для проверки Misaligned Allocators
+        List<CppStructParser.StructInfo> allInfos = new ArrayList<>();
+        for (FileAnalyzer.MarkedStruct m : result.structs) {
+            if (m.info != null) allInfos.add(m.info);
+        }
+        List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues =
+                state.misalignedAllocatorDetection ? MisalignedAllocatorDetector.checkFile(text, allInfos) : Collections.emptyList();
+
         for (FileAnalyzer.MarkedStruct m : result.structs) {
             try {
                 Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap = ensureCellsAndConflicts(m, text, state);
-                drawMarkedStruct(ed, m, state, hotColdMap);
+                drawMarkedStruct(ed, m, state, hotColdMap, allocIssues);
             } catch (Exception ignored) {}
         }
 
@@ -187,7 +173,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
             for (GlobalAtomicsAudit.AuditConflict gc : globalConflicts) {
                 int lineNum = ed.getDocument().getLineNumber(gc.second.offsetInDoc);
                 int lineEnd = ed.getDocument().getLineEndOffset(lineNum);
-                addHint(ed, lineEnd, " [global false sharing: contiguous in .bss/.data]", Color.RED);
+                addHint(ed, lineEnd, " [potential global false sharing: contiguous in .bss/.data]", Color.RED);
             }
         }
     }
@@ -250,7 +236,8 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     static void drawMarkedStruct(Editor ed, FileAnalyzer.MarkedStruct m, HFTSettings.State state,
-                                 Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap) {
+                                 Map<String, AccessPatternAnalyzer.FieldAnalysis> hotColdMap,
+                                 List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues) {
         Document doc = ed.getDocument();
         InlayModel model = ed.getInlayModel();
         int headerLine = doc.getLineNumber(m.region.bStart());
@@ -281,6 +268,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
             }
         }
 
+        // 1. Memory Map Bar Inlay
         if (state.showMemoryMapBar && (state.cacheLineBoundaries || state.paddingVisualization)) {
             InlayProperties props = new InlayProperties();
             props.showAbove(true);
@@ -289,8 +277,29 @@ public class HotPathHighlighter implements EditorFactoryListener {
             model.addBlockElement(doc.getLineStartOffset(headerLine), props, bar);
         }
 
+        // 2. Детекторы кремниевых угроз
+        boolean simdHazard = checkSimdHazard(m);
+        boolean hasAllocMismatch = false;
+        for (MisalignedAllocatorDetector.MisalignedContainerIssue issue : allocIssues) {
+            if (issue.structName.equals(m.info.name)) {
+                hasAllocMismatch = true;
+                break;
+            }
+        }
+
+        List<StoreForwardingDetector.StlfHazard> stlfHazards =
+                state.storeForwardingDetection ? StoreForwardingDetector.detect(m.layout) : Collections.emptyList();
+
+        int bStart = Math.max(0, Math.min(m.region.bStart(), doc.getTextLength()));
+        int bEnd = Math.max(bStart, Math.min(m.region.bEnd(), doc.getTextLength()));
+        String blockText = doc.getText().substring(bStart, bEnd);
+
+        boolean hasVtableHazard = state.virtualCallLinter && VirtualCallLinter.hasVirtualCallHazards(m.info, blockText);
+
         String status;
-        if (state.falseSharingDetection && !risky.isEmpty()) {
+        if (simdHazard) {
+            status = "SIGSEGV HAZARD";
+        } else if (state.falseSharingDetection && !risky.isEmpty()) {
             status = "FALSE SHARING";
         } else if (state.paddingVisualization && m.layout.wasted > 0) {
             status = "WARNING";
@@ -298,7 +307,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
             status = "OK";
         }
 
-        Color labelColor = "FALSE SHARING".equals(status) ? Color.RED
+        Color labelColor = ("SIGSEGV HAZARD".equals(status) || "FALSE SHARING".equals(status)) ? Color.RED
                 : "WARNING".equals(status) ? new Color(220, 160, 50) : new Color(90, 170, 90);
 
         StringBuilder label = new StringBuilder(m.layout.totalSize + "B");
@@ -307,18 +316,29 @@ public class HotPathHighlighter implements EditorFactoryListener {
         }
         label.append(" [").append(status).append("]");
 
-        if (state.zeroAllocLinter) {
-            int bStart = Math.max(0, Math.min(m.region.bStart(), doc.getTextLength()));
-            int bEnd = Math.max(bStart, Math.min(m.region.bEnd(), doc.getTextLength()));
-            String blockText = doc.getText().substring(bStart, bEnd);
-            if (ZeroAllocLinter.hasZeroAllocHazards(m.info, blockText)) {
-                label.append(" [alloc hazard]");
-                labelColor = Color.RED;
-            }
+        if (state.zeroAllocLinter && ZeroAllocLinter.hasZeroAllocHazards(m.info, blockText)) {
+            label.append(" [alloc hazard]");
+            labelColor = Color.RED;
+        }
+
+        if (hasAllocMismatch) {
+            label.append(" [allocator mismatch]");
+            labelColor = Color.RED;
+        }
+
+        if (!stlfHazards.isEmpty()) {
+            label.append(" [stlf hazard]");
+            labelColor = Color.RED;
+        }
+
+        if (hasVtableHazard) {
+            label.append(" [vtable hazard]");
+            labelColor = new Color(220, 140, 50);
         }
 
         addHint(ed, doc.getLineEndOffset(headerLine), label.toString(), labelColor);
 
+        // 3. Строчные подсказки у полей
         boolean showAnyHints = state.showFieldOffsets || state.showPaddingBadges
                 || state.showSplitBadges || state.showFalseSharingBadges || state.showHotColdBadges;
 
@@ -334,25 +354,37 @@ public class HotPathHighlighter implements EditorFactoryListener {
                 Color color = Color.GRAY;
 
                 if (state.showFieldOffsets) {
-                    hint.append("off ").append(f.offset).append(", ").append(f.size).append("B");
+                    if (f.isBitfield) {
+                        hint.append("off ").append(f.offset).append(":").append(f.bitOffsetInUnit).append(", ").append(f.bits).append("b");
+                    } else {
+                        hint.append("off ").append(f.offset).append(", ").append(f.size).append("B");
+                    }
                 }
 
-                if (state.showSplitBadges && state.cacheLineBoundaries && f.size > 1) {
+                // Cache Line Split
+                if (state.showSplitBadges && state.cacheLineBoundaries && f.size > 1 && !f.isBitfield) {
                     if (f.offset / lineSize != (f.offset + f.size - 1) / lineSize) {
                         hint.append(" [split]");
                         color = Color.RED;
                     }
                 }
 
-                if (state.showHotColdBadges && state.hotColdSeparation && hotColdMap != null) {
+                // Hot/Cold индикаторы
+                if (state.showHotColdBadges && hotColdMap != null) {
                     AccessPatternAnalyzer.FieldAnalysis fa = hotColdMap.get(f.name);
-                    if (fa != null && fa.temperature == AccessPatternAnalyzer.Temperature.COLD) {
-                        hint.append(" [cold]");
-                        if (color.equals(Color.GRAY)) color = new Color(170, 120, 190);
+                    if (fa != null) {
+                        if (fa.temperature == AccessPatternAnalyzer.Temperature.COLD) {
+                            hint.append(" [cold]");
+                            if (color.equals(Color.GRAY)) color = new Color(170, 120, 190);
+                        } else if (fa.temperature == AccessPatternAnalyzer.Temperature.HOT) {
+                            hint.append(" [hot]");
+                            if (color.equals(Color.GRAY)) color = new Color(255, 140, 0);
+                        }
                     }
                 }
 
-                if (state.showPaddingBadges && state.paddingVisualization) {
+                // Паддинг
+                if (state.showPaddingBadges && state.paddingVisualization && !f.isBitfield) {
                     int fieldEnd = f.offset + f.size;
                     int nextOffset = (i + 1 < m.layout.fields.size()) ? m.layout.fields.get(i + 1).offset : m.layout.totalSize;
                     int pad = nextOffset - fieldEnd;
@@ -362,6 +394,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
+                // False Sharing
                 String msg = risky.get(i);
                 if (state.showFalseSharingBadges && msg != null && state.falseSharingDetection) {
                     if (msg.contains("Array False Sharing")) {
@@ -379,11 +412,38 @@ public class HotPathHighlighter implements EditorFactoryListener {
                     }
                 }
 
+                // STLF / 4K Aliasing подсказки у полей
+                for (StoreForwardingDetector.StlfHazard hazard : stlfHazards) {
+                    if (hazard.loadField.name.equals(f.name)) {
+                        if (hazard.type == StoreForwardingDetector.StlfHazardType.FOUR_K_ALIASING) {
+                            hint.append(" [4k alias]");
+                        } else {
+                            hint.append(" [stlf stall]");
+                        }
+                        color = Color.RED;
+                    }
+                }
+
                 if (hint.length() > 0) {
                     addHint(ed, position, hint.toString().trim(), color);
                 }
             }
         }
+    }
+
+    private static boolean checkSimdHazard(FileAnalyzer.MarkedStruct m) {
+        if (m.layout == null || m.layout.fields == null) return false;
+        int maxSimd = 0;
+        for (CppStructParser.Field f : m.layout.fields) {
+            String t = f.type.toLowerCase();
+            if (t.contains("__m512")) maxSimd = Math.max(maxSimd, 64);
+            else if (t.contains("__m256")) maxSimd = Math.max(maxSimd, 32);
+            else if (t.contains("__m128")) maxSimd = Math.max(maxSimd, 16);
+        }
+        if (maxSimd > 0) {
+            return m.info.explicitStructAlign < maxSimd;
+        }
+        return false;
     }
 
     static void addHint(Editor ed, int offset, String text, Color color) {
@@ -464,9 +524,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
             String s = visibleRows > 1 ? "s" : "";
             g.setColor(Color.GRAY);
             String title = cells.length + "B (" + visibleRows + " line" + s + ", " + cacheLineSize + "B)";
-            if (cells.length > maxBytesToPaint) {
-                title += " [truncated for performance]";
-            }
+            if (cells.length > maxBytesToPaint) title += " [truncated for performance]";
             g.drawString(title, x0, y0 + g.getFontMetrics().getAscent());
 
             for (int b = 0; b < maxBytesToPaint; b++) {
@@ -492,24 +550,8 @@ public class HotPathHighlighter implements EditorFactoryListener {
         }
 
         private Color resolveCellColor(String fieldName) {
-            if (state.colorScheme == HFTSettings.ColorScheme.HIGH_CONTRAST) {
-                Color[] hcPalette = {
-                        new Color(0x0072B2), new Color(0xE69F00), new Color(0x56B4E9),
-                        new Color(0x009E73), new Color(0xF0E442), new Color(0xCC79A7)
-                };
-                int idx = Math.abs(fieldName.hashCode()) % hcPalette.length;
-                return hcPalette[idx];
-            } else if (state.colorScheme == HFTSettings.ColorScheme.NEON_HFT) {
-                Color[] neonPalette = {
-                        new Color(0x00F5FF), new Color(0x39FF14), new Color(0xFF007F),
-                        new Color(0xBF00FF), new Color(0xFFFF00), new Color(0xFF5F00)
-                };
-                int idx = Math.abs(fieldName.hashCode()) % neonPalette.length;
-                return neonPalette[idx];
-            } else {
-                int hash = fieldName.hashCode() & 255;
-                return Color.getHSBColor(hash / 255f, 0.40f, 0.80f);
-            }
+            int hash = fieldName.hashCode() & 255;
+            return Color.getHSBColor(hash / 255f, 0.40f, 0.80f);
         }
 
         public void showHoverTooltip(Editor editor, Point mousePoint, Rectangle inlayBounds) {

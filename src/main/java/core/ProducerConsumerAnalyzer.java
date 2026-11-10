@@ -9,8 +9,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Context-aware concurrency and access-pattern analyzer.
- * Uses robust brace-depth matching to parse method bodies with arbitrary control flow (if/for/while).
+ * Robust concurrency and access-pattern analyzer.
+ * Robustly parses complex C++ method signatures with default arguments,
+ * noexcept, trailing return types, and nested template arguments.
  */
 public class ProducerConsumerAnalyzer {
 
@@ -88,8 +89,8 @@ public class ProducerConsumerAnalyzer {
         }
     }
 
-    private static final Pattern METHOD_SIG_PATTERN = Pattern.compile(
-            "(?:[a-zA-Z_0-9:<>&*]+\\s+)+([a-zA-Z_0-9]+)\\s*\\([^)]*\\)\\s*(?:const)?\\s*\\{"
+    private static final Pattern METHOD_START_PATTERN = Pattern.compile(
+            "\\b([a-zA-Z_0-9]+)\\s*\\("
     );
 
     private static final Pattern ARRAY_DECL_PATTERN = Pattern.compile("\\[(\\d+)\\]");
@@ -146,13 +147,12 @@ public class ProducerConsumerAnalyzer {
             profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount));
         }
 
-        // Итеративно извлекаем методы с корректным балансом фигурных скобок {}
+        // Парсинг методов без падений на сложных шаблонах и скобках
         List<ExtractedMethod> methods = extractMethods(structBlockText);
         for (ExtractedMethod method : methods) {
             for (CppStructParser.Field field : info.fields) {
                 FieldProfile fp = profile.fields.get(field.name);
                 if (fp == null) continue;
-
                 analyzeFieldUsageInMethod(method.name, method.body, fp);
             }
         }
@@ -192,32 +192,49 @@ public class ProducerConsumerAnalyzer {
     @NotNull
     private static List<ExtractedMethod> extractMethods(@NotNull String structBlock) {
         List<ExtractedMethod> methods = new ArrayList<>();
-        Matcher matcher = METHOD_SIG_PATTERN.matcher(structBlock);
+        String clean = CppStructParser.clearCommentsAndStrings(structBlock);
+        int len = clean.length();
+        Matcher m = METHOD_START_PATTERN.matcher(clean);
 
-        while (matcher.find()) {
-            String methodName = matcher.group(1);
-            int openBracePos = matcher.end() - 1;
-            int closeBracePos = findMatchingCloseBrace(structBlock, openBracePos);
+        while (m.find()) {
+            String methodName = m.group(1);
+            if (methodName.equals("if") || methodName.equals("while") || methodName.equals("for")
+                    || methodName.equals("switch") || methodName.equals("catch") || methodName.equals("alignas")) {
+                continue;
+            }
 
-            if (closeBracePos > openBracePos) {
-                String body = structBlock.substring(openBracePos + 1, closeBracePos);
+            int openParen = m.end() - 1;
+            int closeParen = findMatchingPair(clean, openParen, '(', ')');
+            if (closeParen == -1) continue;
+
+            int openBrace = -1;
+            for (int i = closeParen + 1; i < len; i++) {
+                char c = clean.charAt(i);
+                if (c == ';') break; // Декларация без тела
+                if (c == '{') {
+                    openBrace = i;
+                    break;
+                }
+            }
+            if (openBrace == -1) continue;
+
+            int closeBrace = findMatchingPair(clean, openBrace, '{', '}');
+            if (closeBrace != -1) {
+                String body = structBlock.substring(openBrace + 1, closeBrace);
                 methods.add(new ExtractedMethod(methodName, body));
             }
         }
         return methods;
     }
 
-    private static int findMatchingCloseBrace(@NotNull String text, int openPos) {
+    private static int findMatchingPair(String text, int startIdx, char openChar, char closeChar) {
         int depth = 0;
-        for (int i = openPos; i < text.length(); i++) {
+        for (int i = startIdx; i < text.length(); i++) {
             char c = text.charAt(i);
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
+            if (c == openChar) depth++;
+            else if (c == closeChar) {
                 depth--;
-                if (depth == 0) {
-                    return i;
-                }
+                if (depth == 0) return i;
             }
         }
         return -1;

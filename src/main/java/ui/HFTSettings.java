@@ -46,9 +46,9 @@ public final class HFTSettings implements PersistentStateComponent<HFTSettings.S
         // 1. Графическая карта памяти над структурой
         public boolean showMemoryMapBar = true;
         public boolean hoverTooltips = true;
-        public int maxBarRows = 8; // 0 = без ограничений, иначе лимит строк кэша (8 * 64B = 512B)
+        public int maxBarRows = 8;
 
-        // 2. Строчные бейджи (Inline Hints у полей)
+        // 2. Строчные бейджи
         public boolean showFieldOffsets = true;
         public boolean showPaddingBadges = true;
         public boolean showSplitBadges = true;
@@ -64,7 +64,13 @@ public final class HFTSettings implements PersistentStateComponent<HFTSettings.S
         public boolean globalAtomicsAudit = true;
         public boolean autoEnableCpp = true;
 
-        // 4. Архитектурные параметры
+        // 4. Новые микроархитектурные детекторы (Phase 1 & 2)
+        public boolean storeForwardingDetection = true;
+        public boolean branchPredictorLinter = true;
+        public boolean virtualCallLinter = true;
+        public boolean misalignedAllocatorDetection = true;
+
+        // 5. Архитектурные параметры
         public int cacheLineSize = 64;
         @NotNull
         public ColorScheme colorScheme = ColorScheme.CLASSIC;
@@ -93,6 +99,11 @@ public final class HFTSettings implements PersistentStateComponent<HFTSettings.S
             this.globalAtomicsAudit = other.globalAtomicsAudit;
             this.autoEnableCpp = other.autoEnableCpp;
 
+            this.storeForwardingDetection = other.storeForwardingDetection;
+            this.branchPredictorLinter = other.branchPredictorLinter;
+            this.virtualCallLinter = other.virtualCallLinter;
+            this.misalignedAllocatorDetection = other.misalignedAllocatorDetection;
+
             this.cacheLineSize = other.cacheLineSize;
             this.colorScheme = other.colorScheme;
             this.targetPlatform = other.targetPlatform;
@@ -118,6 +129,10 @@ public final class HFTSettings implements PersistentStateComponent<HFTSettings.S
                     zeroAllocLinter == state.zeroAllocLinter &&
                     globalAtomicsAudit == state.globalAtomicsAudit &&
                     autoEnableCpp == state.autoEnableCpp &&
+                    storeForwardingDetection == state.storeForwardingDetection &&
+                    branchPredictorLinter == state.branchPredictorLinter &&
+                    virtualCallLinter == state.virtualCallLinter &&
+                    misalignedAllocatorDetection == state.misalignedAllocatorDetection &&
                     cacheLineSize == state.cacheLineSize &&
                     colorScheme == state.colorScheme &&
                     targetPlatform == state.targetPlatform;
@@ -130,6 +145,7 @@ public final class HFTSettings implements PersistentStateComponent<HFTSettings.S
                     showFalseSharingBadges, showHotColdBadges,
                     paddingVisualization, cacheLineBoundaries, falseSharingDetection,
                     hotColdSeparation, zeroAllocLinter, globalAtomicsAudit, autoEnableCpp,
+                    storeForwardingDetection, branchPredictorLinter, virtualCallLinter, misalignedAllocatorDetection,
                     cacheLineSize, colorScheme, targetPlatform);
         }
     }
