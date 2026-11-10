@@ -1,6 +1,8 @@
 package ui;
 
+import analysis.MemoryOrderLinter;
 import analysis.StoreForwardingDetector;
+import analysis.TrojanAllocDetector;
 import analysis.ZeroAllocLinter;
 import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.fileEditor.FileEditorManager;
@@ -11,7 +13,6 @@ import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.table.JBTable;
 import com.intellij.util.ui.JBUI;
 import dev.hotpath.FileAnalyzer;
-import dev.hotpath.LayoutCalculator;
 
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
@@ -54,7 +55,6 @@ public class HFTDashboardPanel extends JPanel {
         setLayout(new BorderLayout());
         setBorder(JBUI.Borders.empty(10));
 
-        // Карточка сводки метрик
         JPanel summaryCard = new JPanel(new GridLayout(2, 1, 0, 4));
         summaryCard.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(JBColor.border()),
@@ -66,7 +66,6 @@ public class HFTDashboardPanel extends JPanel {
         summaryCard.add(lblHealthScore);
         summaryCard.add(lblLatencyTax);
 
-        // Таблица детекций с сортировкой по стоимости
         String[] columns = {"Severity", "Penalty", "Hazard Type", "Target"};
         tableModel = new DefaultTableModel(columns, 0) {
             @Override
@@ -82,7 +81,6 @@ public class HFTDashboardPanel extends JPanel {
         issuesTable.getColumnModel().getColumn(2).setPreferredWidth(140);
         issuesTable.getColumnModel().getColumn(3).setPreferredWidth(120);
 
-        // Клик по таблице перемещает курсор к месту ошибки
         issuesTable.addMouseListener(new MouseAdapter() {
             @Override
             public void mouseClicked(MouseEvent e) {
@@ -161,10 +159,11 @@ public class HFTDashboardPanel extends JPanel {
                 currentIssues.add(new IssueItem("INFO", "Padding Waste (" + m.layout.wasted + "B)", sName, 2, 0.4, m.region.bStart()));
             }
 
-            // 4. Zero Alloc Linter
             int bStart = Math.max(0, m.region.bStart());
             int bEnd = Math.min(m.region.bEnd(), text.length());
             String blockText = text.substring(bStart, bEnd);
+
+            // 4. Zero Alloc Linter
             List<ZeroAllocLinter.AllocationHazard> hazards = ZeroAllocLinter.inspectMethodBodies(blockText, bStart);
             for (ZeroAllocLinter.AllocationHazard h : hazards) {
                 int cycles = 500;
@@ -181,16 +180,30 @@ public class HFTDashboardPanel extends JPanel {
                     totalCycles += cycles;
                 }
             }
+
+            // 6. Memory Order seq_cst Linter
+            List<MemoryOrderLinter.MemoryOrderHazard> moHazards = MemoryOrderLinter.inspect(m.info, blockText, bStart);
+            for (MemoryOrderLinter.MemoryOrderHazard moh : moHazards) {
+                int cycles = 35;
+                currentIssues.add(new IssueItem("HIGH", "seq_cst Penalty", sName + "::" + moh.atomicName, cycles, cycles / 4.5, moh.offsetInDoc));
+                totalCycles += cycles;
+            }
+
+            // 7. Trojan Allocators (скрытые контейнеры)
+            List<TrojanAllocDetector.TrojanHazard> trojans = TrojanAllocDetector.inspectFields(m.info);
+            for (TrojanAllocDetector.TrojanHazard th : trojans) {
+                int cycles = 250;
+                currentIssues.add(new IssueItem("HIGH", "Hidden Allocator: " + th.typeName, sName + "::" + th.fieldName, cycles, cycles / 4.5, bStart));
+                totalCycles += cycles;
+            }
         }
 
-        // Сортировка проблем: сначала самые тяжелые по тактам
         currentIssues.sort((a, b) -> Integer.compare(b.penaltyCycles, a.penaltyCycles));
 
         for (IssueItem item : currentIssues) {
             tableModel.addRow(new Object[]{item.severity, item.penaltyCycles + " cyc", item.type, item.structAndField});
         }
 
-        // Расчет итогового Health Score
         int health = Math.max(0, 100 - (totalCycles / 15) - (totalWastedBytes / 4));
         String healthColor = health > 80 ? "#27ae60" : health > 50 ? "#e67e22" : "#c0392b";
         lblHealthScore.setText("<html><b>Memory Health Score:</b> <span style='color:" + healthColor + "; font-size:13px;'>" + health + "/100</span></html>");

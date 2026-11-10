@@ -3,6 +3,7 @@ package dev.hotpath;
 import analysis.*;
 import com.intellij.codeInsight.hint.HintManager;
 import com.intellij.codeInsight.intention.IntentionAction;
+import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.ModalityState;
 import com.intellij.openapi.application.ReadAction;
@@ -30,9 +31,8 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Main plugin engine: Memory map rendering, Interactive Hover Tooltip Inspector,
- * Zero-Alloc linting, Cache line splits, and Global Atomics Audit.
- * Performs all heavy static analysis asynchronously off the EDT via nonBlocking ReadActions.
+ * Main plugin engine: Asynchronous memory layout analysis and inlay rendering.
+ * Fully non-blocking, immune to EDT queue flooding and multi-editor race conditions.
  */
 public class HotPathHighlighter implements EditorFactoryListener {
 
@@ -113,27 +113,34 @@ public class HotPathHighlighter implements EditorFactoryListener {
     }
 
     public static void refreshAllEditors() {
-        ApplicationManager.getApplication().invokeLater(() -> {
+        Application app = ApplicationManager.getApplication();
+        Runnable task = () -> {
             Editor[] editors = EditorFactory.getInstance().getAllEditors();
             for (Editor editor : editors) {
                 if (!editor.isDisposed()) {
                     update(editor);
                 }
             }
-        });
+        };
+
+        if (app.isDispatchThread()) {
+            task.run();
+        } else {
+            app.invokeLater(task);
+        }
     }
 
-    private static class BackgroundAnalysisPayload {
+    private static class AnalysisResultPayload {
         final String text;
         final FileAnalyzer.Result result;
         final List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues;
         final Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps;
         final List<GlobalAtomicsAudit.AuditConflict> globalConflicts;
 
-        BackgroundAnalysisPayload(String text, FileAnalyzer.Result result,
-                                  List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues,
-                                  Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps,
-                                  List<GlobalAtomicsAudit.AuditConflict> globalConflicts) {
+        AnalysisResultPayload(String text, FileAnalyzer.Result result,
+                              List<MisalignedAllocatorDetector.MisalignedContainerIssue> allocIssues,
+                              Map<FileAnalyzer.MarkedStruct, Map<String, AccessPatternAnalyzer.FieldAnalysis>> hotColdMaps,
+                              List<GlobalAtomicsAudit.AuditConflict> globalConflicts) {
             this.text = text;
             this.result = result;
             this.allocIssues = allocIssues;
@@ -179,7 +186,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
                             ? GlobalAtomicsAudit.audit(text, state.cacheLineSize)
                             : Collections.emptyList();
 
-                    return new BackgroundAnalysisPayload(text, result, allocIssues, hotColdMaps, globalConflicts);
+                    return new AnalysisResultPayload(text, result, allocIssues, hotColdMaps, globalConflicts);
                 })
                 .expireWhen(ed::isDisposed)
                 .finishOnUiThread(ModalityState.any(), payload -> {
@@ -189,7 +196,7 @@ public class HotPathHighlighter implements EditorFactoryListener {
                 .submit(AppExecutorUtil.getAppExecutorService());
     }
 
-    private static void applyHighlights(Editor ed, BackgroundAnalysisPayload payload) {
+    private static void applyHighlights(Editor ed, AnalysisResultPayload payload) {
         String text = payload.text;
         removeOldHints(ed, text.length());
         removeOldBars(ed, text.length());

@@ -5,7 +5,7 @@
 
     <description><![CDATA[
       High-frequency trading memory layout optimizer, cache contention analyzer,
-      STLF stall detector, SIMD Crash Guard and Compiler Explorer ASM bridge for C++.
+      STLF stall detector, SIMD Crash Guard, memory_order optimizer and Compiler Explorer bridge for C++.
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
@@ -29,7 +29,7 @@
 
         <editorFactoryListener implementation="dev.hotpath.HotPathHighlighter"/>
 
-        <!-- Intentions -->
+        <!-- Core Intentions -->
         <intentionAction>
             <className>dev.hotpath.HotPathHighlighter$Optimize</className>
             <category>C/C++ HFT Optimizations</category>
@@ -79,9 +79,13 @@
             <category>C/C++ HFT Optimizations</category>
         </intentionAction>
 
-        <!-- Новые намерения (Phase 1 & 2) -->
+        <!-- Silicon & Concurrency Intentions -->
         <intentionAction>
             <className>optimization.BranchLikelyIntention</className>
+            <category>C/C++ HFT Optimizations</category>
+        </intentionAction>
+        <intentionAction>
+            <className>optimization.MemoryOrderFixerIntention</className>
             <category>C/C++ HFT Optimizations</category>
         </intentionAction>
         <intentionAction>

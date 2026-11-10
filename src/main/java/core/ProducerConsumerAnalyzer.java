@@ -10,7 +10,7 @@ import java.util.regex.Pattern;
 
 /**
  * Robust concurrency and access-pattern analyzer.
- * Pre-compiles field access patterns to minimize GC overhead and parse complex C++ method bodies.
+ * Linear time-complexity method extractor immune to ReDoS.
  */
 public class ProducerConsumerAnalyzer {
 
@@ -88,6 +88,7 @@ public class ProducerConsumerAnalyzer {
         }
     }
 
+    // ReDoS-Safe linear method declaration matcher without nested plus quantifiers
     private static final Pattern METHOD_START_PATTERN = Pattern.compile(
             "\\b([a-zA-Z_0-9]+)\\s*\\("
     );
@@ -146,7 +147,6 @@ public class ProducerConsumerAnalyzer {
             profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount));
         }
 
-        // Прекомпиляция регулярных выражений: ровно 1 раз на поле (сложность O(F) вместо O(M * F))
         Map<String, Pattern> writePatterns = new HashMap<>();
         Map<String, Pattern> prefixIncPatterns = new HashMap<>();
         Map<String, Pattern> readPatterns = new HashMap<>();

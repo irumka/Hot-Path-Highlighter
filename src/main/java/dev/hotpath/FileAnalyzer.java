@@ -8,8 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 
 /**
- * Headless file analysis engine: finds marked regions, parses AST,
- * computes layouts, and detects false sharing without editor dependencies.
+ * Headless file analysis engine with fixed-point dependency convergence.
  */
 public class FileAnalyzer {
 
@@ -50,7 +49,6 @@ public class FileAnalyzer {
 
     public static Result analyze(String text) {
         Result r = new Result();
-        // Прямой вызов парсера регионов без зависимости от редактора HotPathHighlighter
         ArrayList<HotRegionFinder.Region> regions = HotRegionFinder.findAllStructs(text);
         int limit = Math.min(regions.size(), 300);
 
@@ -65,15 +63,25 @@ public class FileAnalyzer {
             }
         }
 
-        for (int round = 0; round < 2; round++) {
+        // Fix 3.1: Fixed-Point Iteration (Converges in 1-2 passes, halts early if no dependencies changed)
+        int maxRounds = 3;
+        for (int round = 0; round < maxRounds; round++) {
+            boolean changed = false;
             for (int i = 0; i < limit; i++) {
                 CppStructParser.StructInfo info = infos.get(i);
-                if (info == null) continue;
+                if (info == null || info.name.isEmpty()) continue;
+
+                int[] prev = r.locals.get(info.name);
                 LayoutCalculator.Layout l = LayoutCalculator.compute(info, r.locals);
-                if (l.complete && !info.name.isEmpty()) {
-                    r.locals.put(info.name, new int[]{l.totalSize, maxAlignOf(l)});
+                if (l.complete) {
+                    int newAlign = maxAlignOf(l);
+                    if (prev == null || prev[0] != l.totalSize || prev[1] != newAlign) {
+                        r.locals.put(info.name, new int[]{l.totalSize, newAlign});
+                        changed = true;
+                    }
                 }
             }
+            if (!changed) break; // Топологическая сходимость достигнута
         }
 
         int cacheLineSize = HotPathSettings.get().cacheLine();
@@ -127,7 +135,6 @@ public class FileAnalyzer {
                 m.conflicts.add(new FalseSharingAnalyzer.Conflict(idxA, idxB, c.description, false));
             }
 
-            LayoutCalculator.ConflictHolder.conflicts = detectorResult.conflicts.size();
             m.layout.conflicts = detectorResult.conflicts.size();
             m.layout.score = LayoutCalculator.healthScore(m.layout, HotPathSettings.get(), m.layout.conflicts);
             m.fieldEnds = new int[l.fields.size()];

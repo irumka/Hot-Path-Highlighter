@@ -9,8 +9,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Resolves C++ type sizes, alignments and atomic traits across different ABIs.
- * Supports recursive std::array<T, N>, std::optional<T>, C-arrays, and STL containers.
+ * Resolves C++ type sizes, alignments and atomic traits across ABIs.
+ * Thread-safe with computeIfAbsent, correct regexes, and recursive std::array support.
  */
 public class TypeResolver {
 
@@ -61,14 +61,8 @@ public class TypeResolver {
         }
 
         String cacheKey = effPlatform.name() + ":" + type;
-        TypeInfo cached = CACHE.get(cacheKey);
-        if (cached != null) {
-            return cached;
-        }
-
-        TypeInfo info = resolveDirect(type, effPlatform, customTypes);
-        CACHE.put(cacheKey, info);
-        return info;
+        // Fix 3.3: computeIfAbsent eliminates thundering herd redundancy
+        return CACHE.computeIfAbsent(cacheKey, k -> resolveDirect(type, effPlatform, customTypes));
     }
 
     private static boolean isPowerOfTwo(int n) {
@@ -86,13 +80,12 @@ public class TypeResolver {
                                           Map<String, int[]> customTypes) {
         boolean isWin = PlatformDetector.isWindows(effPlatform);
         boolean isMac = PlatformDetector.isMac(effPlatform);
-        int ptrSize = 8; // 64-bit ABI default
+        int ptrSize = 8;
 
         if (type.endsWith("*") || type.endsWith("&")) {
             return new TypeInfo(ptrSize, ptrSize);
         }
 
-        // 1. std::atomic<T>
         Matcher atomicMatcher = ATOMIC_PATTERN.matcher(type);
         if (atomicMatcher.find()) {
             String innerType = atomicMatcher.group(1).trim();
@@ -104,7 +97,6 @@ public class TypeResolver {
             return new TypeInfo(inner.size, atomicAlign, true);
         }
 
-        // 2. Рекурсивный std::array<T, N>
         Matcher stdArrayMatcher = STD_ARRAY_PATTERN.matcher(type);
         if (stdArrayMatcher.find()) {
             String elemType = stdArrayMatcher.group(1).trim();
@@ -117,17 +109,16 @@ public class TypeResolver {
             return new TypeInfo(elemInfo.size * count, elemInfo.align);
         }
 
-        // 3. std::optional<T> (значение T + флаг bool + паддинг до alignof(T))
         Matcher optMatcher = STD_OPTIONAL_PATTERN.matcher(type);
         if (optMatcher.find()) {
             String innerType = optMatcher.group(1).trim();
             TypeInfo inner = resolve(innerType, effPlatform, customTypes);
-            int payloadSize = inner.size + 1; // T + sizeof(bool)
+            int payloadSize = inner.size + 1;
             int totalSize = roundUp(payloadSize, inner.align);
             return new TypeInfo(totalSize, inner.align);
         }
 
-        // 4. Обычные C-массивы T[N]
+        // Fix 1.3: ARRAY_PATTERN with literal brackets \\[ and \\]
         Matcher arrayMatcher = ARRAY_PATTERN.matcher(type);
         if (arrayMatcher.find()) {
             String elemType = arrayMatcher.group(1).trim();
@@ -272,6 +263,7 @@ public class TypeResolver {
 
     private static String normalizeType(String type) {
         if (type == null) return "";
+        // Fix 2.1: Double-escaped word boundaries
         String t = CONST_PATTERN.matcher(type).replaceAll("");
         t = VOLATILE_PATTERN.matcher(t).replaceAll("");
         t = WHITESPACE_PATTERN.matcher(t).replaceAll(" ");

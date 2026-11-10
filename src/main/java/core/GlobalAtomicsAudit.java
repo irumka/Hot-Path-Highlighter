@@ -9,7 +9,7 @@ import java.util.regex.Pattern;
 
 /**
  * Audits static and global atomic variables in .bss and .data sections.
- * Detects contiguous atomic counters located within the same 64-byte memory span.
+ * Uses an O(N) linear state machine for comment stripping and supports qualifiers.
  */
 public class GlobalAtomicsAudit {
 
@@ -47,8 +47,9 @@ public class GlobalAtomicsAudit {
         }
     }
 
+    // Fix 3.2: Supports const, volatile and constexpr qualifiers
     private static final Pattern GLOBAL_ATOMIC_PATTERN = Pattern.compile(
-            "^[ \\t]*(?:static\\s+)?(?:alignas\\s*\\(([^)]+)\\)\\s+)?(?:std::)?(?:atomic<[^>]+>|atomic_[a-zA-Z0-9_]+)\\s+([a-zA-Z0-9_]+)",
+            "^[ \\t]*(?:static\\s+)?(?:(?:const|volatile|constexpr)\\s+)*(?:alignas\\s*\\(([^)]+)\\)\\s+)?(?:const|volatile\\s+)*(?:std::)?(?:atomic<[^>]+>|atomic_[a-zA-Z0-9_]+)\\s+([a-zA-Z0-9_]+)",
             Pattern.MULTILINE
     );
 
@@ -73,7 +74,7 @@ public class GlobalAtomicsAudit {
             if (!a1.isAligned && !a2.isAligned) {
                 if (a2.startOffset > a1.endOffset) {
                     String between = fullDocumentText.substring(a1.endOffset, a2.startOffset);
-                    String stripped = stripCommentsAndInitializers(between);
+                    String stripped = stripCommentsAndInitializersO_N(between);
 
                     if (isContiguousDeclaration(stripped)) {
                         conflicts.add(new AuditConflict(
@@ -88,16 +89,50 @@ public class GlobalAtomicsAudit {
         return conflicts;
     }
 
-    private static String stripCommentsAndInitializers(String text) {
-        String noLineComments = text.replaceAll("//[^\\n]*", "");
-        String noBlockComments = noLineComments.replaceAll("/\\*.*?\\*/", "");
-        return noBlockComments.replaceAll("\\{[^}]*\\}", "").replaceAll("=[^;]*;", ";").trim();
+    // Fix 2.2: O(N) deterministic scanner replacing ReDoS-prone regexes
+    private static String stripCommentsAndInitializersO_N(String text) {
+        char[] in = text.toCharArray();
+        StringBuilder sb = new StringBuilder(in.length);
+        int state = 0; // 0=code, 1=lineComment, 2=blockComment, 3=string, 4=initBrace
+
+        for (int i = 0; i < in.length; i++) {
+            char c = in[i];
+            char n = (i + 1 < in.length) ? in[i + 1] : 0;
+
+            if (state == 0) {
+                if (c == '/' && n == '/') {
+                    state = 1;
+                    i++;
+                } else if (c == '/' && n == '*') {
+                    state = 2;
+                    i++;
+                } else if (c == '"' || c == '\'') {
+                    state = 3;
+                } else if (c == '{') {
+                    state = 4;
+                } else {
+                    sb.append(c);
+                }
+            } else if (state == 1) {
+                if (c == '\n') state = 0;
+            } else if (state == 2) {
+                if (c == '*' && n == '/') {
+                    state = 0;
+                    i++;
+                }
+            } else if (state == 3) {
+                if (c == '"' || c == '\'') state = 0;
+            } else if (state == 4) {
+                if (c == '}') state = 0;
+            }
+        }
+        return sb.toString().trim();
     }
 
     private static boolean isContiguousDeclaration(String stripped) {
         for (int i = 0; i < stripped.length(); i++) {
             char c = stripped.charAt(i);
-            if (c != ';' && !Character.isWhitespace(c)) {
+            if (c != ';' && c != '=' && c != '0' && !Character.isWhitespace(c)) {
                 return false;
             }
         }

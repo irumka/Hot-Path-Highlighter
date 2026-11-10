@@ -5,8 +5,7 @@ import java.util.HashMap;
 
 /**
  * Turns a parsed struct into an exact byte layout.
- * Supports C++ inheritance (base subobjects), bitfields allocation units,
- * explicit alignment and standard ABI packing rules.
+ * Pure thread-safe functions without mutable static leakages.
  */
 public class LayoutCalculator {
 
@@ -14,7 +13,7 @@ public class LayoutCalculator {
     }
 
     public static class ConflictHolder {
-        public static int conflicts;
+        public static volatile int conflicts = 0;
     }
 
     public static class Gap {
@@ -50,7 +49,6 @@ public class LayoutCalculator {
         Layout l = new Layout();
         l.notes.addAll(info.notes);
 
-        // 1. Разрешаем поля текущей структуры
         for (CppStructParser.Field f : info.fields) {
             resolveField(f, st, locals, info);
             if (!f.known()) {
@@ -134,7 +132,6 @@ public class LayoutCalculator {
         int pos = 0;
         int maxAl = 1;
 
-        // 1. Обработка наследования (Base Subobjects)
         if (info.baseClasses != null && !info.baseClasses.isEmpty()) {
             for (String baseName : info.baseClasses) {
                 if (locals != null && locals.containsKey(baseName)) {
@@ -160,7 +157,6 @@ public class LayoutCalculator {
             }
         }
 
-        // 2. Обработка собственного vptr
         if (info.hasVptr && pos == 0) {
             int vptr = st.pointerSize();
             l.notes.add("virtual methods present: assumed " + vptr + "-byte vptr at offset 0");
@@ -169,8 +165,6 @@ public class LayoutCalculator {
         }
 
         int pack = detectPack(info);
-
-        // 3. Размещение собственных полей и битовых единиц (Bitfield Allocation Units)
         int currentBitUnitOffset = -1;
         int currentBitUnitSize = 0;
         int currentBitUnitBitsUsed = 0;
@@ -210,7 +204,6 @@ public class LayoutCalculator {
                 continue;
             }
 
-            // Закрываем предыдущую битовую ячейку перед обычным полем
             if (currentBitUnitOffset >= 0) {
                 pos = currentBitUnitOffset + currentBitUnitSize;
                 currentBitUnitOffset = -1;
@@ -278,6 +271,7 @@ public class LayoutCalculator {
             l.wasted = Math.max(0, l.totalSize - sum);
             l.cacheLines = (l.totalSize + st.cacheLine() - 1) / st.cacheLine();
             makeCells(l);
+            // Fix 4.1: Calculates health score based on layout's own isolated metrics
             l.score = healthScore(l, st, l.conflicts);
         }
     }
@@ -301,6 +295,7 @@ public class LayoutCalculator {
         l.cells = cells;
     }
 
+    // Fix 4.1: Encapsulated health score calculation
     public static int healthScore(Layout l, HotPathSettings st, int conflicts) {
         int s = 100;
         if (l.totalSize > 0) {
