@@ -9,8 +9,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Robust concurrency and access-pattern analyzer.
- * Linear time-complexity method extractor immune to ReDoS.
+ * Context-aware concurrency and access-pattern analyzer.
+ * Strictly separates single-threaded structures from concurrent hot paths.
+ * Prevents False Sharing false positives on single-threaded code.
  */
 public class ProducerConsumerAnalyzer {
 
@@ -34,23 +35,31 @@ public class ProducerConsumerAnalyzer {
         public final boolean isMutex;
         public final boolean isArray;
         public final int arraySize;
+        public final String explicitThreadTag;
         public AccessType accessType = AccessType.NONE;
         public final Set<String> writerMethods = new HashSet<>();
         public final Set<String> readerMethods = new HashSet<>();
 
-        public FieldProfile(String name, boolean isAtomic, boolean isMutex, boolean isArray, int arraySize) {
+        public FieldProfile(String name, boolean isAtomic, boolean isMutex, boolean isArray, int arraySize, String explicitThreadTag) {
             this.name = name;
             this.isAtomic = isAtomic;
             this.isMutex = isMutex;
             this.isArray = isArray;
             this.arraySize = Math.max(1, arraySize);
+            this.explicitThreadTag = explicitThreadTag != null ? explicitThreadTag.toLowerCase() : null;
         }
 
         public boolean isProducer() {
+            if (explicitThreadTag != null) {
+                return explicitThreadTag.contains("producer") || explicitThreadTag.contains("write");
+            }
             return accessType == AccessType.WRITE_ONLY || (!writerMethods.isEmpty() && readerMethods.isEmpty());
         }
 
         public boolean isConsumer() {
+            if (explicitThreadTag != null) {
+                return explicitThreadTag.contains("consumer") || explicitThreadTag.contains("read");
+            }
             return accessType == AccessType.READ_ONLY || (!readerMethods.isEmpty() && writerMethods.isEmpty());
         }
     }
@@ -60,6 +69,7 @@ public class ProducerConsumerAnalyzer {
         public ConcurrencyModel concurrencyModel;
         public final Map<String, FieldProfile> fields = new HashMap<>();
         public boolean hasAtomicsOrLocks = false;
+        public boolean hasThreadAnnotations = false;
 
         public StructProfile(String name, ConcurrencyModel concurrencyModel) {
             this.name = name;
@@ -71,10 +81,18 @@ public class ProducerConsumerAnalyzer {
             return fields.get(fieldName);
         }
 
+        /**
+         * Структура считается многопоточной ТОЛЬКО при наличии явных признаков конкурентности.
+         * Однопоточный код гарантированно возвращает false.
+         */
         public boolean isConcurrent() {
+            if (concurrencyModel == ConcurrencyModel.CONTROL_PLANE) {
+                return false;
+            }
             return concurrencyModel == ConcurrencyModel.EXPLICIT_CONCURRENT ||
                     concurrencyModel == ConcurrencyModel.QUEUE_OR_RINGBUFFER ||
-                    hasAtomicsOrLocks;
+                    hasAtomicsOrLocks ||
+                    hasThreadAnnotations;
         }
     }
 
@@ -88,18 +106,25 @@ public class ProducerConsumerAnalyzer {
         }
     }
 
-    // ReDoS-Safe linear method declaration matcher without nested plus quantifiers
     private static final Pattern METHOD_START_PATTERN = Pattern.compile(
             "\\b([a-zA-Z_0-9]+)\\s*\\("
     );
 
     private static final Pattern ARRAY_DECL_PATTERN = Pattern.compile("\\[(\\d+)\\]");
 
+    // Имена многопоточных контейнеров
     private static final Pattern QUEUE_NAME_PATTERN = Pattern.compile(
-            ".*(queue|ringbuffer|ring_buffer|spsc|mpmc|spmc|mpsc|channel|disruptor|mailbox|worker|pool|pingpong|ping_pong|ping|invalidation|producer|consumer|concurrent).*",
+            ".*(queue|ringbuffer|ring_buffer|spsc|mpmc|spmc|mpsc|channel|disruptor|mailbox|worker|pool|pingpong|ping_pong|invalidation).*",
             Pattern.CASE_INSENSITIVE
     );
 
+    // Имена методов с явной многопоточной семантикой (воркеры, писатели/читатели)
+    private static final Pattern CONCURRENT_METHOD_PATTERN = Pattern.compile(
+            "^(worker|thread|producer|consumer|produce|consume|enqueue|dequeue|on_thread).*",
+            Pattern.CASE_INSENSITIVE
+    );
+
+    // Классы управления и оркестраторы (Control Plane)
     private static final Pattern ORCHESTRATOR_PATTERN = Pattern.compile(
             ".*(manager|orchestrator|config|context|builder|factory|registry|service).*",
             Pattern.CASE_INSENSITIVE
@@ -118,6 +143,7 @@ public class ProducerConsumerAnalyzer {
 
         StructProfile profile = new StructProfile(structName, model);
 
+        // 1. Сканирование полей на атомики, блокировки и потоковые теги (@threads)
         for (CppStructParser.Field field : info.fields) {
             String decl = field.decl != null ? field.decl.toLowerCase() : "";
             boolean isAtomic = decl.contains("atomic") || decl.contains("atomic_flag");
@@ -144,54 +170,34 @@ public class ProducerConsumerAnalyzer {
                 profile.hasAtomicsOrLocks = true;
             }
 
-            profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount));
+            if (field.thread != null && !field.thread.isEmpty()) {
+                profile.hasThreadAnnotations = true;
+            }
+
+            profile.fields.put(field.name, new FieldProfile(field.name, isAtomic, isMutex, isArray, arrayCount, field.thread));
         }
 
-        Map<String, Pattern> writePatterns = new HashMap<>();
-        Map<String, Pattern> prefixIncPatterns = new HashMap<>();
-        Map<String, Pattern> readPatterns = new HashMap<>();
-
-        for (CppStructParser.Field field : info.fields) {
-            String quotedField = Pattern.quote(field.name);
-            writePatterns.put(field.name, Pattern.compile(
-                    "\\b" + quotedField + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
-                    Pattern.MULTILINE
-            ));
-            prefixIncPatterns.put(field.name, Pattern.compile("(?:\\+\\+|--)\\s*" + quotedField + "\\b"));
-            readPatterns.put(field.name, Pattern.compile("\\b" + quotedField + "\\b"));
-        }
-
+        // 2. Извлечение методов
         List<ExtractedMethod> methods = extractMethods(structBlockText);
+        boolean hasExplicitConcurrentMethods = false;
+
         for (ExtractedMethod method : methods) {
+            if (CONCURRENT_METHOD_PATTERN.matcher(method.name).matches()) {
+                hasExplicitConcurrentMethods = true;
+            }
+
             for (CppStructParser.Field field : info.fields) {
                 FieldProfile fp = profile.fields.get(field.name);
                 if (fp == null) continue;
 
-                String body = method.body;
-                Pattern wp = writePatterns.get(field.name);
-                Pattern pip = prefixIncPatterns.get(field.name);
-                Pattern rp = readPatterns.get(field.name);
-
-                boolean isWrite = (wp != null && wp.matcher(body).find()) ||
-                        (pip != null && pip.matcher(body).find());
-                boolean isMentioned = (rp != null && rp.matcher(body).find());
-
-                if (isWrite) {
-                    fp.writerMethods.add(method.name);
-                } else if (isMentioned) {
-                    fp.readerMethods.add(method.name);
-                }
+                analyzeFieldUsageInMethod(method.name, method.body, fp);
             }
         }
 
-        int writeFieldCount = 0;
-        int readFieldCount = 0;
+        // 3. Вычисление типов доступа
         for (FieldProfile fp : profile.fields.values()) {
             boolean hasWrites = !fp.writerMethods.isEmpty();
             boolean hasReads = !fp.readerMethods.isEmpty();
-
-            if (hasWrites) writeFieldCount++;
-            if (hasReads) readFieldCount++;
 
             if (hasWrites && hasReads) {
                 fp.accessType = AccessType.READ_WRITE;
@@ -202,15 +208,18 @@ public class ProducerConsumerAnalyzer {
             }
         }
 
+        // 4. Повышение статуса до многопоточного ТОЛЬКО если есть явные маркеры
         if (profile.concurrencyModel != ConcurrencyModel.CONTROL_PLANE) {
-            if (writeFieldCount >= 2 || (writeFieldCount >= 1 && readFieldCount >= 1)) {
+            if (profile.hasAtomicsOrLocks || profile.hasThreadAnnotations) {
+                profile.concurrencyModel = ConcurrencyModel.EXPLICIT_CONCURRENT;
+            } else if (hasExplicitConcurrentMethods && profile.concurrencyModel == ConcurrencyModel.QUEUE_OR_RINGBUFFER) {
+                profile.hasAtomicsOrLocks = true;
+            } else if (hasExplicitConcurrentMethods) {
+                // Если методы явно названы worker_a / produce / consume
                 profile.concurrencyModel = ConcurrencyModel.QUEUE_OR_RINGBUFFER;
                 profile.hasAtomicsOrLocks = true;
             }
-        }
-
-        if (profile.hasAtomicsOrLocks && profile.concurrencyModel != ConcurrencyModel.QUEUE_OR_RINGBUFFER) {
-            profile.concurrencyModel = ConcurrencyModel.EXPLICIT_CONCURRENT;
+            // Обычные геттеры/сеттеры (get/set) в обычных классах БОЛЬШЕ НЕ ДЕЛАЮТ класс многопоточным!
         }
 
         return profile;
@@ -265,5 +274,25 @@ public class ProducerConsumerAnalyzer {
             }
         }
         return -1;
+    }
+
+    private static void analyzeFieldUsageInMethod(String methodName, String body, FieldProfile fp) {
+        String quotedField = Pattern.quote(fp.name);
+
+        Pattern writePattern = Pattern.compile(
+                "\\b" + quotedField + "\\s*(?:[+\\-*/%&|^]?=|\\+\\+|--|\\.store|\\.exchange|\\.fetch_add|\\.fetch_sub|\\.fetch_and|\\.fetch_or)",
+                Pattern.MULTILINE
+        );
+        Pattern prefixIncPattern = Pattern.compile("(?:\\+\\+|--)\\s*" + quotedField + "\\b");
+
+        boolean isWrite = writePattern.matcher(body).find() || prefixIncPattern.matcher(body).find();
+        Pattern readPattern = Pattern.compile("\\b" + quotedField + "\\b");
+        boolean isMentioned = readPattern.matcher(body).find();
+
+        if (isWrite) {
+            fp.writerMethods.add(methodName);
+        } else if (isMentioned) {
+            fp.readerMethods.add(methodName);
+        }
     }
 }

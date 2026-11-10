@@ -6,11 +6,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Intelligent False Sharing Detector with MESI Hazard Grading:
- * - WRITE_WRITE_PING_PONG: Both threads perform stores (Severe MESI RFO bounce)
- * - READ_INVALIDATION: One thread stores, another loads
- * - ARRAY_HAZARD: Worker pool array sharing lines
- * - BUFFER_COLLISION: Ring buffer data colliding with index pointers
+ * Intelligent False Sharing Detector with MESI Hazard Grading.
+ * Operates strictly on multi-threaded code. Single-threaded structs always evaluate to SAFE.
  */
 public class FalseSharingDetector {
 
@@ -92,20 +89,19 @@ public class FalseSharingDetector {
         int lineSize = cacheLineSize > 0 ? cacheLineSize : 64;
         Result result = new Result(lineSize);
 
+        // ЖЕСТКАЯ ОТСЕЧКА: Однопоточный код НИКОГДА не генерирует False Sharing
         if (!profile.isConcurrent()) {
             result.status = HazardLevel.SAFE;
             return result;
         }
 
-        // 1. Детекция Array False Sharing с валидацией размера (отсекает size <= 0 и уже выровненные массивы >= lineSize)
+        // 1. Детекция Array False Sharing (только если размер элемента < строки кэша)
         for (CacheField f : fields) {
-            if (!f.known() || f.size <= 0) {
-                continue;
-            }
+            if (!f.known() || f.size <= 0) continue;
 
             if (f.isArray && f.arrayCount > 1) {
                 int elemSize = f.elementSize();
-                if (elemSize > 0 && elemSize < lineSize && (f.isAtomic || profile.hasAtomicsOrLocks)) {
+                if (elemSize > 0 && elemSize < lineSize) {
                     Conflict c = new Conflict(f, f, f.cacheLineIndex, HazardLevel.ARRAY_HAZARD,
                             "Array False Sharing: worker elements (" + elemSize + "B) share cache lines");
                     result.conflicts.add(c);
@@ -114,7 +110,7 @@ public class FalseSharingDetector {
             }
         }
 
-        // 2. Межполевой анализ с проверкой диапазона линий
+        // 2. Межполевой анализ многопоточной коллизии
         for (int i = 0; i < fields.size(); i++) {
             CacheField f1 = fields.get(i);
             if (!f1.known()) continue;
@@ -128,12 +124,11 @@ public class FalseSharingDetector {
                 int f2End = (f2.offset + Math.max(1, f2.size) - 1) / lineSize;
 
                 boolean sharesLine = f1Start <= f2End && f2Start <= f1End;
-                if (!sharesLine) {
-                    continue;
-                }
+                if (!sharesLine) continue;
 
                 int conflictLine = Math.max(f1Start, f2Start);
 
+                // Очередь / кольцевой буфер (хранилище делит строку с атомарным курсором)
                 if ((f1.isAtomic && f2.isArray) || (f2.isAtomic && f1.isArray)) {
                     Conflict c = new Conflict(f1, f2, conflictLine, HazardLevel.BUFFER_COLLISION,
                             "Queue Collision: buffer storage shares line with atomic pointer");
@@ -141,13 +136,17 @@ public class FalseSharingDetector {
                     if (result.status != HazardLevel.WRITE_WRITE_PING_PONG) {
                         result.status = HazardLevel.BUFFER_COLLISION;
                     }
-                } else if (f1.isProducer && f2.isProducer) {
+                }
+                // Write-Write Ping-Pong (два потока пишут в одну строку)
+                else if (f1.isProducer && f2.isProducer) {
                     Conflict c = new Conflict(f1, f2, conflictLine, HazardLevel.WRITE_WRITE_PING_PONG,
                             "MESI Write-Write Ping-Pong: concurrent stores on line #" + conflictLine +
                                     " (" + f1.name + " and " + f2.name + ")");
                     result.conflicts.add(c);
                     result.status = HazardLevel.WRITE_WRITE_PING_PONG;
-                } else if ((f1.isProducer && f2.isConsumer) || (f1.isConsumer && f2.isProducer)) {
+                }
+                // Read Invalidation (один поток пишет, второй читает)
+                else if ((f1.isProducer && f2.isConsumer) || (f1.isConsumer && f2.isProducer)) {
                     Conflict c = new Conflict(f1, f2, conflictLine, HazardLevel.READ_INVALIDATION,
                             "MESI Read Invalidation: store to " + (f1.isProducer ? f1.name : f2.name) +
                                     " invalidates reader of " + (f1.isConsumer ? f1.name : f2.name));
@@ -155,7 +154,9 @@ public class FalseSharingDetector {
                     if (result.status != HazardLevel.WRITE_WRITE_PING_PONG) {
                         result.status = HazardLevel.READ_INVALIDATION;
                     }
-                } else if (f1.isAtomic || f2.isAtomic) {
+                }
+                // Потенциальный конфликт атомика с обычным полем
+                else if (f1.isAtomic || f2.isAtomic) {
                     Conflict c = new Conflict(f1, f2, conflictLine, HazardLevel.POTENTIAL,
                             "Potential False Sharing: atomic shares line with " + (f1.isAtomic ? f2.name : f1.name));
                     result.conflicts.add(c);
